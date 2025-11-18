@@ -19,6 +19,9 @@ from pymc_bart.pgbart import PGBART
 from pymc_bart.dtbart import DecisionTableBART, DTBART
 from pymc_bart.decision_table import DecisionTable 
 
+from .dtbart import DecisionTableBART, DTBART
+__all__.extend(["DecisionTableBART", "DTBART"])
+
 # Split rules и утилиты
 from pymc_bart.split_rules import (
     ContinuousSplitRule,
