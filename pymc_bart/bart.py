@@ -1,18 +1,5 @@
 # pylint: disable=unused-argument
 # pylint: disable=arguments-differ
-#   Copyright 2022 The PyMC Developers
-#
-#   Licensed under the Apache License, Version 2.0 (the "License");
-#   you may not use this file except in compliance with the License.
-#   You may obtain a copy of the License at
-#
-#       http://www.apache.org/licenses/LICENSE-2.0
-#
-#   Unless required by applicable law or agreed to in writing, software
-#   distributed under the License is distributed on an "AS IS" BASIS,
-#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#   See the License for the specific language governing permissions and
-#   limitations under the License.
 
 import warnings
 from multiprocessing import Manager
@@ -109,6 +96,10 @@ class BART(Distribution):
         This flag forces a fully separate tree structure to be trained instead.
         This is unnecessary in many cases and is considerably slower, multiplying
         run-time roughly by number of dimensions.
+    tree_type : str, default 'normal'
+        Type of trees to use. 'normal' for standard trees, 'decision_table' for symmetric trees.
+    max_depth : int, default 5
+        Maximum depth for decision tables (only used when tree_type='decision_table').
 
     Notes
     -----
@@ -132,6 +123,8 @@ class BART(Distribution):
         split_prior: npt.NDArray | None = None,
         split_rules: list[SplitRule] | None = None,
         separate_trees: bool | None = False,
+        tree_type: str = "normal",
+        max_depth: int = 5,
         **kwargs,
     ):
         if response in ["linear", "mix"]:
@@ -164,6 +157,8 @@ class BART(Distribution):
                 "split_prior": split_prior,
                 "split_rules": split_rules,
                 "separate_trees": separate_trees,
+                "tree_type": tree_type,
+                "max_depth": max_depth,
             },
         )()
 
