@@ -1,31 +1,25 @@
-# Copyright 2022 The PyMC Developers
+#   Copyright 2022 The PyMC Developers
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#       http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
 import pymc as pm
 
 from pymc_bart.bart import BART
 from pymc_bart.pgbart import PGBART
-from pymc_bart.dtbart import DecisionTableBART, DTBART
-from pymc_bart.decision_table import DecisionTable 
 
+from .decision_table import DecisionTable
+from .mhbart import MHBART
 
-# Split rules и утилиты
-from pymc_bart.split_rules import (
-    ContinuousSplitRule,
-    OneHotSplitRule,
-    SubsetSplitRule,
-)
+from pymc_bart.split_rules import ContinuousSplitRule, OneHotSplitRule, SubsetSplitRule
 from pymc_bart.utils import (
     compute_variable_importance,
     get_variable_inclusion,
@@ -41,9 +35,8 @@ from pymc_bart.utils import (
 __all__ = [
     "BART",
     "PGBART",
-    "DecisionTableBART",   
-    "DTBART",             
-    "DecisionTable",       
+    "DecisionTable",
+    "MHBART",
     "ContinuousSplitRule",
     "OneHotSplitRule",
     "SubsetSplitRule",
@@ -57,13 +50,7 @@ __all__ = [
     "plot_variable_inclusion",
     "vi_to_kulprit",
 ]
-
 __version__ = "0.11.0"
 
-from .dtbart import DecisionTableBART, DTBART
-__all__.extend(["DecisionTableBART", "DTBART"])
 
-pm.STEP_METHODS = list(pm.STEP_METHODS) + [PGBART, DTBART]
-
-pm.DecisionTableBART = DecisionTableBART
-pm.DTBART = DTBART 
+pm.STEP_METHODS = list(pm.STEP_METHODS) + [PGBART]
