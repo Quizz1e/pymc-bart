@@ -1,11 +1,4 @@
-# decision_table.py
-# Decision table (catboost-like symmetric trees) implementation
-# Designed to be compatible with pymc-bart style tree API,
-# but specialized for symmetric trees (the same predicate on every node per level)
-
-# pymc_bart/decision_table.py
-from __future__ import annotations
-
+# src/pymc_bart/decision_table.py
 import numpy as np
 import numpy.typing as npt
 from pytensor import config
@@ -14,71 +7,99 @@ from .split_rules import SplitRule
 
 
 class DecisionTable:
-    """
-    Oblivious decision table = полностью симметричное дерево,
-    где на каждом уровне используется одна и та же переменная и один и тот же порог.
-    """
-    __slots__ = ("depth", "features", "thresholds", "leaf_values", "split_rules", "shape")
+    """Oblivious decision table (CatBoost-style tree) для BART."""
+    __slots__slots__ = ("splits", "leaf_values", "leaf_idx", "split_rules", "depth", "m", "leaves_shape")
 
-    def __init__(self, split_rules: list[SplitRule], shape: int = 1):
+    def __init__(
+        self,
+        splits: list[tuple[int, float]],
+        leaf_values: npt.NDArray,
+        leaf_idx: list[npt.NDArray],
+        split_rules: list[SplitRule],
+        m: int,
+        leaves_shape: int,
+    ):
+        self.splits = splits
+        self.leaf_values = leaf_values.astype(config.floatX)
+        self.leaf_idx = leaf_idx
         self.split_rules = split_rules
-        self.shape = shape
+        self.depth = len(splits)
+        self.m = m
+        self.leaves_shape = leaves_shape
+        assert len(leaf_values) == 2 ** self.depth
+        assert len(leaf_idx) == 2 ** self.depth
 
-        self.depth = 0
-        self.features: list[int] = []
-        self.thresholds: list[float] = []
-        self.leaf_values: npt.NDArray = np.zeros((1, shape), dtype=config.floatX)
+    @classmethod
+    def initial(cls, init_val: float, n_obs: int, leaves_shape: int, split_rules: list[SplitRule], m: int):
+        leaf_values = np.full((1, leaves_shape), init_val, dtype=config.floatX)
+        leaf_idx = [np.arange(n_obs, dtype=np.int32)]
+        return cls([], leaf_values, leaf_idx, split_rules, m, leaves_shape)
 
-    def copy(self) -> "DecisionTable":
-        new = DecisionTable(self.split_rules, self.shape)
-        new.depth = self.depth
-        new.features = self.features.copy()
-        new.thresholds = self.thresholds.copy()
-        new.leaf_values = self.leaf_values.copy()
-        return new
-
-    def num_leaves(self) -> int:
-        return 1 << self.depth                      # 2**depth
-
-    def get_leaf_indices(self, X: npt.NDArray) -> npt.NDArray:
-        """Возвращает индекс листа для каждой наблюдения."""
-        n = X.shape[0]
-        indices = np.zeros(n, dtype=np.int32)
-
-        for level in range(self.depth):
-            feat = self.features[level]
-            thr = self.thresholds[level]
-            to_right = self.split_rules[feat].divide(X[:, feat], thr)
-            indices = indices * 2 + to_right.astype(np.int32)
-
-        return indices
+    def copy(self):
+        return DecisionTable(
+            splits=self.splits.copy(),
+            leaf_values=self.leaf_values.copy(),
+            leaf_idx=[arr.copy() for arr in self.leaf_idx],
+            split_rules=self.split_rules,
+            m=self.m,
+            leaves_shape=self.leaves_shape,
+        )
 
     def predict(self, X: npt.NDArray) -> npt.NDArray:
-        """Предсказание дерева на матрице X."""
+        """O(n × depth) предсказание."""
         if self.depth == 0:
-            return np.tile(self.leaf_values, (X.shape[0], 1))
+            return np.full((X.shape[0], self.leaves_shape), self.leaf_values[0])
 
-        leaf_idx = self.get_leaf_indices(X)
+        leaf_idx = np.zeros(X.shape[0], dtype=np.int32)
+        power = 1
+        for var_idx, split_val in self.splits:
+            to_left = self.split_rules[var_idx].divide(X[:, var_idx], split_val)
+            leaf_idx += to_left.astype(np.int32) * power
+            power <<= 1
         return self.leaf_values[leaf_idx]
 
-    def grow(self, feature: int, threshold: float):
-        """Добавить один уровень."""
-        self.features.append(feature)
-        self.thresholds.append(threshold)
-        self.depth += 1
-        # дублируем текущие значения листьев
-        self.leaf_values = np.repeat(self.leaf_values, 2, axis=0)
+    def get_split_variables(self) -> set[int]:
+        return {var_idx for var_idx, _ in self.splits}
 
-    def prune(self):
-        """Убрать последний уровень (оставляем только чётные листья)."""
+    def _grow(self, var_idx: int, split_val: float) -> "DecisionTable | None":
+        new_n = len(self.leaf_idx) * 2
+        new_values = np.empty((new_n, self.leaves_shape), dtype=config.floatX)
+        new_idx = []
+
+        for i, idxs in enumerate(self.leaf_idx):
+            values = self.X[idxs, var_idx]
+            mask = self.split_rules[var_idx].divide(values, split_val)
+            left = idxs[mask]
+            right = idxs[~mask]
+            if len(left) == 0 or len(right) == 0:
+                return None
+            new_idx.extend([left, right])
+            new_values[2*i] = self.leaf_values[i]
+            new_values[2*i+1] = self.leaf_values[i]
+
+        return DecisionTable(
+            splits=self.splits + [(var_idx, split_val)],
+            leaf_values=new_values,
+            leaf_idx=new_idx,
+            split_rules=self.split_rules,
+            m=self.m,
+            leaves_shape=self.leaves_shape,
+        )
+
+    def _prune(self) -> "DecisionTable":
         if self.depth == 0:
-            return
-        self.features.pop()
-        self.thresholds.pop()
-        self.depth -= 1
-        self.leaf_values = self.leaf_values[::2].copy()
-
-    def change_level(self, level: int, new_feature: int, new_threshold: float):
-        """Сменить фичу и порог на конкретном уровне."""
-        self.features[level] = new_feature
-        self.thresholds[level] = new_threshold
+            return self
+        new_n = len(self.leaf_idx) // 2
+        new_values = np.empty((new_n, self.leaves_shape), dtype=config.floatX)
+        new_idx = []
+        for i in range(new_n):
+            new_idx.append(np.concatenate([self.leaf_idx[2*i], self.leaf_idx[2*i+1]))
+            new_values[i] = self.leaf_values[2*i]  # не важно, будет перезаписано
+        return DecisionTable(
+            splits=self.splits[:-1],
+            leaf_values=new_values,
+            leaf_idx=new_idx,
+            split_rules=self.split_rules,
+            m=self.m,
+            leaves_shape=self.leaves_shape,
+        )
