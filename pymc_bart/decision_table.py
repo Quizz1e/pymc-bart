@@ -67,7 +67,7 @@ class DecisionTable:
         self.thresholds.append(threshold)
         self.depth += 1
         # дублируем текущие значения листьев
-        self.leaf_values = np.repeat(self.leaf_values, 2, axis=axis=0)
+        self.leaf_values = np.repeat(self.leaf_values, 2, axis=0)
 
     def prune(self):
         """Убрать последний уровень (оставляем только чётные листья)."""
