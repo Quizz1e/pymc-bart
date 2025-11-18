@@ -210,7 +210,7 @@ class DTMHSampler:
         new_tree.route_data(self.X)
         return new_tree
 
-    def _move_add_depth(self, tree: DecisionTable) -> Optional[DecisionTable]:
+     def _move_add_depth(self, tree: DecisionTable) -> Optional[DecisionTable]:
         """Add one level (depth+1) if not exceeding max_depth."""
         if tree.depth >= self.max_depth:
             return None
@@ -230,12 +230,15 @@ class DTMHSampler:
         feature_per_level.append(new_feat)
         split_value_per_level.append(new_thr)
         leaf_init = np.array([0.0])
+        split_rules_instances = [
+            sr() if isinstance(sr, type) else sr.__class__() for sr in self.split_rules
+        ]
         new_tree = DecisionTable.new_table(
             depth=new_depth,
             leaf_node_value=leaf_init,
             num_observations=self.n,
             shape=1,
-            split_rules=[type(sr)() if hasattr(sr, "__class__") else sr for sr in self.split_rules],
+            split_rules=split_rules_instances,
             feature_per_level=feature_per_level,
             split_value_per_level=split_value_per_level,
         )
@@ -258,12 +261,15 @@ class DTMHSampler:
             feature_per_level.append(int(f))
             split_value_per_level.append(float(s))
         leaf_init = np.array([0.0])
+        split_rules_instances = [
+            sr() if isinstance(sr, type) else sr.__class__() for sr in self.split_rules
+        ]
         new_tree = DecisionTable.new_table(
             depth=new_depth,
             leaf_node_value=leaf_init,
             num_observations=self.n,
             shape=1,
-            split_rules=[type(sr)() if hasattr(sr, "__class__") else sr for sr in self.split_rules],
+            split_rules=split_rules_instances,
             feature_per_level=feature_per_level,
             split_value_per_level=split_value_per_level,
         )
