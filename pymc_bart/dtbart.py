@@ -18,7 +18,6 @@ from pytensor.tensor.random.op import RandomVariable
 from .bart import preprocess_xy
 from .decision_table import DecisionTable
 from .split_rules import ContinuousSplitRule
-from .tree import RunningSd
 from .utils import _sample_posterior
 
 
