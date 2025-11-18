@@ -15,10 +15,6 @@ import pymc as pm
 
 from pymc_bart.bart import BART
 from pymc_bart.pgbart import PGBART
-
-from .decision_table import DecisionTable
-from .mhbart import MHBART
-
 from pymc_bart.split_rules import ContinuousSplitRule, OneHotSplitRule, SubsetSplitRule
 from pymc_bart.utils import (
     compute_variable_importance,
@@ -35,8 +31,6 @@ from pymc_bart.utils import (
 __all__ = [
     "BART",
     "PGBART",
-    "DecisionTable",
-    "MHBART",
     "ContinuousSplitRule",
     "OneHotSplitRule",
     "SubsetSplitRule",
