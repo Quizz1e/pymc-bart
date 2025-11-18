@@ -43,7 +43,7 @@ class DecisionTableBART(Distribution):
     rv_op = dtbart_rv
 
     @classmethod
-    def dist(cls, X, Y, m=50, alpha=0.95, beta=beta=2.0, split_prior=None, **kwargs):
+    def dist(cls, X, Y, m=50, alpha=0.95, beta=2.0, split_prior=None, **kwargs):
         X, Y = preprocess_xy(X, Y)
         split_prior = np.array([]) if split_prior is None else np.asarray(split_prior)
 
