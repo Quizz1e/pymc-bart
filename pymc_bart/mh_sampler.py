@@ -2,7 +2,7 @@
 
 import numpy as np
 import numpy.typing as npt
-from pymc.step_methods.arraystep import BlockedArrayStepShared
+from pymc.step_methods.arraystep import ArrayStepShared
 from pymc.step_methods.compound import Competence
 from pytensor import config
 
@@ -210,7 +210,7 @@ class ChangeMove(MHDecisionTableMove):
         return new_table, log_alpha
 
 
-class MHDecisionTableSampler(BlockedArrayStepShared):
+class MHDecisionTableSampler(ArrayStepShared):
     """
     Metropolis-Hastings sampler for Decision Tables.
 
@@ -231,7 +231,7 @@ class MHDecisionTableSampler(BlockedArrayStepShared):
     """
 
     name = "mh_decision_table"
-    default_blocked = True
+    default_blocked = False
     generates_stats = True
     stats_dtypes_shapes: dict[str, tuple[type, list]] = {
         "variable_inclusion": (object, []),
