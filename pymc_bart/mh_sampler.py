@@ -2,15 +2,15 @@
 
 import numpy as np
 import numpy.typing as npt
-from numba import njit
 from pymc.step_methods.arraystep import ArrayStepShared
 from pymc.step_methods.compound import Competence
 from pytensor import config
 
 import pymc as pm
 from pymc.model import Model, modelcontext
-from pymc.pytensorf import inputvars, join_nonshared_inputs, make_shared_replacements
+from pymc.pytensorf import inputvars, make_shared_replacements
 from pytensor.tensor.variable import Variable
+from pytensor import function as pytensor_function
 
 from pymc_bart.bart import BARTRV
 from pymc_bart.decision_table import DecisionTable, DecisionTableNode
@@ -101,12 +101,10 @@ class GrowMove(MHDecisionTableMove):
         )
 
         # Compute Hastings ratio
-        # Forward: grow a leaf
-        # Backward: prune this node
         n_leaf_nodes = len(leaf_nodes)
-        n_split_nodes = len(new_table.tree_structure) - n_leaf_nodes
+        n_split_nodes = len(new_table.get_leaf_nodes()) - 1
 
-        log_alpha = np.log(n_split_nodes) - np.log(n_leaf_nodes)
+        log_alpha = np.log(max(n_split_nodes, 1)) - np.log(n_leaf_nodes)
 
         return new_table, log_alpha
 
@@ -126,8 +124,8 @@ class PruneMove(MHDecisionTableMove):
 
         # Get all split nodes
         split_nodes = [
-            (node, idx)
-            for idx, node in new_table.root.children.items()
+            node
+            for node in _get_all_nodes(new_table.root)
             if node.is_split_node()
         ]
 
@@ -136,7 +134,7 @@ class PruneMove(MHDecisionTableMove):
 
         # Select random split node
         split_idx = np.random.randint(0, len(split_nodes))
-        node_to_prune, node_idx = split_nodes[split_idx]
+        node_to_prune = split_nodes[split_idx]
 
         # Check if both children are leaves
         if not all(child.is_leaf_node() for child in node_to_prune.children.values()):
@@ -150,12 +148,12 @@ class PruneMove(MHDecisionTableMove):
         node_to_prune.value = new_leaf_value
         node_to_prune.children = {}
 
-        # Compute Hastings ratio (inverse of grow)
+        # Compute Hastings ratio
         leaf_nodes = new_table.get_leaf_nodes()
         n_leaf_nodes = len(leaf_nodes)
-        n_split_nodes = sum(1 for node in new_table.root.children.values() if node.is_split_node())
+        n_split_nodes = len(split_nodes) - 1
 
-        log_alpha = np.log(n_leaf_nodes) - np.log(n_split_nodes + 1)
+        log_alpha = np.log(n_leaf_nodes) - np.log(max(n_split_nodes, 1))
 
         return new_table, log_alpha
 
@@ -175,7 +173,9 @@ class ChangeMove(MHDecisionTableMove):
 
         # Get all split nodes
         split_nodes = [
-            node for node in new_table.root.children.values() if node.is_split_node()
+            node
+            for node in _get_all_nodes(new_table.root)
+            if node.is_split_node()
         ]
 
         if not split_nodes:
@@ -184,11 +184,10 @@ class ChangeMove(MHDecisionTableMove):
         # Select random split node
         split_idx = np.random.randint(0, len(split_nodes))
         node = split_nodes[split_idx]
-        old_split_var = node.idx_split_variable
 
         # Change split variable (with some probability keep the same)
         if np.random.random() < 0.5:
-            new_split_var = old_split_var
+            new_split_var = node.idx_split_variable
         else:
             new_split_var = np.random.randint(0, X.shape[1])
 
@@ -320,12 +319,13 @@ class MHDecisionTableSampler(ArrayStepShared):
             for _ in range(self.m)
         ]
 
-        self.all_tables = [self.tables.copy()]
+        self.all_tables = [[t.trim() for t in self.tables]]
         self.accept_count = 0
         self.iteration = 0
+        self.model = model
 
         shared = make_shared_replacements(initial_point, [value_bart], model)
-        self.likelihood_logp = logp(initial_point, [model.datalogp], [value_bart], shared)
+        self.value_bart = value_bart
 
         super().__init__([value_bart], shared)
 
@@ -333,12 +333,12 @@ class MHDecisionTableSampler(ArrayStepShared):
         """Execute one MH step."""
         variable_inclusion = np.zeros(self.num_variates, dtype="int")
         accept_rates = []
+        move_idx = 0
 
         for table_idx in range(self.m):
             # Select move type
             move_idx = np.random.choice(len(self.moves), p=self.move_probs)
             move = self.moves[move_idx]
-            move_name = self.move_names[move_idx]
 
             # Propose new table
             proposed_table, log_hastings = move.propose(
@@ -346,6 +346,7 @@ class MHDecisionTableSampler(ArrayStepShared):
             )
 
             if log_hastings == -np.inf:
+                accept_rates.append(0.0)
                 continue
 
             # Compute log likelihood ratio
@@ -395,14 +396,12 @@ class MHDecisionTableSampler(ArrayStepShared):
         new_pred: npt.NDArray,
     ) -> float:
         """Compute log likelihood ratio for MH acceptance."""
-        # Assuming Gaussian likelihood
         residuals_old = self.Y - old_pred
         residuals_new = self.Y - new_pred
 
         sse_old = np.sum(residuals_old**2)
         sse_new = np.sum(residuals_new**2)
 
-        # Log likelihood ratio (proportional)
         log_lik_ratio = 0.5 * (sse_old - sse_new) / (self.leaf_sd**2)
 
         return log_lik_ratio
@@ -450,18 +449,9 @@ def _draw_leaf_value(Y: npt.NDArray, leaf_sd: float) -> npt.NDArray:
     return np.array([np.mean(Y) + np.random.normal(0, leaf_sd)])
 
 
-def logp(
-    point,
-    out_vars: list[pm.Distribution],
-    vars: list[pm.Distribution],
-    shared: list,
-):
-    """Compile PyTensor function of the model and the input and output variables."""
-    from pytensor.tensor.variable import Variable as TensorVariable
-    from pymc.pytensorf import join_nonshared_inputs
-    from pytensor import function as pytensor_function
-
-    out_list, inarray0 = join_nonshared_inputs(point, out_vars, vars, shared)
-    function = pytensor_function([inarray0], out_list[0])
-    function.trust_input = True
-    return function
+def _get_all_nodes(node: DecisionTableNode) -> list[DecisionTableNode]:
+    """Get all nodes in the tree."""
+    nodes = [node]
+    for child in node.children.values():
+        nodes.extend(_get_all_nodes(child))
+    return nodes
