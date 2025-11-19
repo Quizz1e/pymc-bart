@@ -14,6 +14,7 @@
 import pymc as pm
 
 from pymc_bart.bart import BART
+from pymc_bart.decision_table import DecisionTable, DecisionTableNode
 from pymc_bart.pgbart import PGBART
 from pymc_bart.split_rules import ContinuousSplitRule, OneHotSplitRule, SubsetSplitRule
 from pymc_bart.utils import (
@@ -31,6 +32,8 @@ from pymc_bart.utils import (
 __all__ = [
     "BART",
     "PGBART",
+    "DecisionTable",
+    "DecisionTableNode",
     "ContinuousSplitRule",
     "OneHotSplitRule",
     "SubsetSplitRule",
