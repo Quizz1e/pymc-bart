@@ -2,7 +2,7 @@
 
 import numpy as np
 import numpy.typing as npt
-from pymc.step_methods.arraystep import ArrayStepShared
+from pymc.step_methods.arraystep import BlockedArrayStepShared
 from pymc.step_methods.compound import Competence
 from pytensor import config
 
@@ -10,7 +10,6 @@ import pymc as pm
 from pymc.model import Model, modelcontext
 from pymc.pytensorf import inputvars, make_shared_replacements
 from pytensor.tensor.variable import Variable
-from pytensor import function as pytensor_function
 
 from pymc_bart.bart import BARTRV
 from pymc_bart.decision_table import DecisionTable, DecisionTableNode
@@ -211,7 +210,7 @@ class ChangeMove(MHDecisionTableMove):
         return new_table, log_alpha
 
 
-class MHDecisionTableSampler(ArrayStepShared):
+class MHDecisionTableSampler(BlockedArrayStepShared):
     """
     Metropolis-Hastings sampler for Decision Tables.
 
@@ -229,12 +228,10 @@ class MHDecisionTableSampler(ArrayStepShared):
         Optional model for sampling step. Defaults to None (taken from context).
     initial_point : Optional dict
         Initial point for sampling
-    compile_kwargs : Optional dict
-        Kwargs for PyTensor function compilation
     """
 
     name = "mh_decision_table"
-    default_blocked = False
+    default_blocked = True
     generates_stats = True
     stats_dtypes_shapes: dict[str, tuple[type, list]] = {
         "variable_inclusion": (object, []),
@@ -250,12 +247,13 @@ class MHDecisionTableSampler(ArrayStepShared):
         leaf_sd: float = 1.0,
         model: Model | None = None,
         initial_point: dict | None = None,
-        compile_kwargs: dict | None = None,
         **kwargs,
     ) -> None:
         model = modelcontext(model)
+        
         if initial_point is None:
             initial_point = model.initial_point()
+        
         if vars is None:
             vars = model.value_vars
         else:
@@ -327,7 +325,7 @@ class MHDecisionTableSampler(ArrayStepShared):
         shared = make_shared_replacements(initial_point, [value_bart], model)
         self.value_bart = value_bart
 
-        super().__init__([value_bart], shared)
+        super().__init__([value_bart], shared, **kwargs)
 
     def astep(self, _):
         """Execute one MH step."""
