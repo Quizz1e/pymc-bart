@@ -260,6 +260,12 @@ class MHDecisionTableSampler(ArrayStepShared):
         Number of decision tables. Defaults to 50
     move_probs : tuple[float, float, float]
         Probabilities for (grow, prune, change) moves. Defaults to (0.33, 0.33, 0.34)
+    move_adapt_rate : float
+        Exponential moving-average rate for adaptive move probabilities.
+        Must be in (0, 1]. Defaults to 0.1.
+    move_prob_prior : float
+        Positive prior weight added to each move score before normalization.
+        Helps keep all moves selectable. Defaults to 0.05.
     leaf_sd : float
         Standard deviation for leaf values. Defaults to 1.0
     n_jobs : int
@@ -286,6 +292,8 @@ class MHDecisionTableSampler(ArrayStepShared):
         vars: list[pm.Distribution] | None = None,
         num_tables: int = 50,
         move_probs: tuple[float, float, float] = (0.33, 0.33, 0.34),
+        move_adapt_rate: float = 0.1,
+        move_prob_prior: float = 0.05,
         leaf_sd: float = 1.0,
         n_jobs: int = 1,
         rng_seed: int | None = None,
@@ -349,10 +357,19 @@ class MHDecisionTableSampler(ArrayStepShared):
             raise ValueError("move_probs must all be positive.")
         self.move_probs = move_probs / move_probs.sum()
 
+        self.move_adapt_rate = float(move_adapt_rate)
+        if not (0.0 < self.move_adapt_rate <= 1.0):
+            raise ValueError("move_adapt_rate must be in (0, 1].")
+
+        self.move_prob_prior = float(move_prob_prior)
+        if self.move_prob_prior <= 0:
+            raise ValueError("move_prob_prior must be positive.")
+
         # Initialize move operators
         self.moves = [GrowMove(), PruneMove(), ChangeMove()]
         self.move_names = ["grow", "prune", "change"]
         self.reverse_move_idx = [1, 0, 2]
+        self.move_accept_ema = self.move_probs.astype(float).copy()
         self.rng = np.random.default_rng(rng_seed)
         self.n_jobs = max(1, int(n_jobs))
 
@@ -418,6 +435,7 @@ class MHDecisionTableSampler(ArrayStepShared):
                     variable_inclusion[var] += 1
 
         self.iteration += sum(1 for res in results if res["count_iteration"])
+        self._update_move_probabilities(results)
 
         # Store all tables for posterior inference
         self.all_tables.append([t.trim() for t in self.tables])
@@ -527,6 +545,29 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         _traverse(table.root)
         return split_vars
+
+    def _update_move_probabilities(self, results: list[dict]) -> None:
+        """Adapt move probabilities using recent acceptance outcomes."""
+        if not results:
+            return
+
+        adapt_rate = self.move_adapt_rate
+        decay = 1.0 - adapt_rate
+
+        for result in results:
+            move_idx = result.get("move_idx")
+            if move_idx is None:
+                continue
+
+            accepted = float(result.get("accepted", 0))
+            current = self.move_accept_ema[move_idx]
+            self.move_accept_ema[move_idx] = decay * current + adapt_rate * accepted
+
+        scores = self.move_accept_ema + self.move_prob_prior
+        total = float(scores.sum())
+        if total <= 0:
+            return
+        self.move_probs = scores / total
 
     @staticmethod
     def competence(var: pm.Distribution, has_grad: bool) -> Competence:
