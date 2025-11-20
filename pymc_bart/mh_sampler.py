@@ -61,20 +61,24 @@ class GrowMove(MHDecisionTableMove):
     ) -> tuple[DecisionTable, float]:
         """Propose growing a random leaf node."""
         new_table = table.copy()
-        leaf_nodes = new_table.get_leaf_nodes()
+        leaf_nodes = new_table.get_leaf_nodes(with_depth=True)
 
         if not leaf_nodes:
             return new_table, -np.inf
 
         # Select random leaf node
         leaf_idx = np.random.randint(0, len(leaf_nodes))
-        leaf_node = leaf_nodes[leaf_idx]
+        leaf_node, depth = leaf_nodes[leaf_idx]
+
+        node_mask = _get_node_mask(new_table, leaf_node, X)
+        if node_mask is None or not np.any(node_mask):
+            return new_table, -np.inf
 
         # Select random split variable
         split_var = np.random.randint(0, X.shape[1])
 
         # Get available split values
-        available_splits = _get_available_splits(X, split_var)
+        available_splits = _get_available_splits(X, split_var, node_mask)
         if available_splits.size == 0:
             return new_table, -np.inf
 
@@ -83,10 +87,17 @@ class GrowMove(MHDecisionTableMove):
         if split_value is None:
             return new_table, -np.inf
 
-        # Compute new leaf values
-        to_left = table.split_rules[split_var].divide(available_splits, split_value).astype(bool)
-        left_value = _draw_leaf_value(Y, leaf_sd)
-        right_value = _draw_leaf_value(Y, leaf_sd)
+        split_rule = table.split_rules[split_var]
+        division = split_rule.divide(X[:, split_var], split_value).astype(bool)
+
+        left_mask = node_mask & division
+        right_mask = node_mask & (~division)
+
+        if not left_mask.any() or not right_mask.any():
+            return new_table, -np.inf
+
+        left_value = _draw_leaf_value(Y, leaf_sd, left_mask)
+        right_value = _draw_leaf_value(Y, leaf_sd, right_mask)
 
         # Grow the leaf
         new_table.grow_leaf_node(
@@ -95,13 +106,14 @@ class GrowMove(MHDecisionTableMove):
             split_value=np.array([split_value]),
             left_value=left_value,
             right_value=right_value,
-            left_nvalue=np.sum(to_left),
-            right_nvalue=np.sum(~to_left),
+            left_nvalue=int(left_mask.sum()),
+            right_nvalue=int(right_mask.sum()),
+            depth=depth,
         )
 
         # Compute Hastings ratio
         n_leaf_nodes = len(leaf_nodes)
-        n_split_nodes = len(new_table.get_leaf_nodes()) - 1
+        n_split_nodes = new_table.count_split_nodes()
 
         log_alpha = np.log(max(n_split_nodes, 1)) - np.log(n_leaf_nodes)
 
@@ -122,35 +134,36 @@ class PruneMove(MHDecisionTableMove):
         new_table = table.copy()
 
         # Get all split nodes
-        split_nodes = [
-            node
-            for node in _get_all_nodes(new_table.root)
-            if node.is_split_node()
-        ]
+        split_nodes = new_table.get_split_nodes(with_depth=True)
 
         if not split_nodes:
             return new_table, -np.inf
 
         # Select random split node
         split_idx = np.random.randint(0, len(split_nodes))
-        node_to_prune = split_nodes[split_idx]
+        node_to_prune, _ = split_nodes[split_idx]
 
         # Check if both children are leaves
         if not all(child.is_leaf_node() for child in node_to_prune.children.values()):
             return new_table, -np.inf
 
+        node_mask = _get_node_mask(new_table, node_to_prune, X)
+        if node_mask is None or not node_mask.any():
+            return new_table, -np.inf
+
         # Draw new leaf value
-        new_leaf_value = _draw_leaf_value(Y, leaf_sd)
+        new_leaf_value = _draw_leaf_value(Y, leaf_sd, node_mask)
 
         # Prune: convert split node to leaf
-        node_to_prune.idx_split_variable = -1
-        node_to_prune.value = new_leaf_value
-        node_to_prune.children = {}
+        new_table.prune_node(
+            node=node_to_prune,
+            new_value=new_leaf_value,
+            nvalue=int(node_mask.sum()),
+        )
 
         # Compute Hastings ratio
-        leaf_nodes = new_table.get_leaf_nodes()
-        n_leaf_nodes = len(leaf_nodes)
-        n_split_nodes = len(split_nodes) - 1
+        n_leaf_nodes = new_table.count_leaf_nodes()
+        n_split_nodes = max(new_table.count_split_nodes(), 1)
 
         log_alpha = np.log(n_leaf_nodes) - np.log(max(n_split_nodes, 1))
 
@@ -171,18 +184,14 @@ class ChangeMove(MHDecisionTableMove):
         new_table = table.copy()
 
         # Get all split nodes
-        split_nodes = [
-            node
-            for node in _get_all_nodes(new_table.root)
-            if node.is_split_node()
-        ]
+        split_nodes = new_table.get_split_nodes(with_depth=True)
 
         if not split_nodes:
             return new_table, -np.inf
 
         # Select random split node
         split_idx = np.random.randint(0, len(split_nodes))
-        node = split_nodes[split_idx]
+        node, depth = split_nodes[split_idx]
 
         # Change split variable (with some probability keep the same)
         if np.random.random() < 0.5:
@@ -200,9 +209,12 @@ class ChangeMove(MHDecisionTableMove):
         if split_value is None:
             return new_table, -np.inf
 
-        # Update node
-        node.idx_split_variable = new_split_var
-        node.value = np.array([split_value])
+        # Update node + depth predicate
+        new_table.update_level_predicate(
+            depth=depth,
+            split_variable=new_split_var,
+            split_value=np.array([split_value]),
+        )
 
         # Hastings ratio = 1 (symmetric proposal)
         log_alpha = 0.0
@@ -436,20 +448,58 @@ class MHDecisionTableSampler(ArrayStepShared):
         return (update_stats,)
 
 
-def _get_available_splits(X: npt.NDArray, var_idx: int) -> npt.NDArray:
+def _get_available_splits(
+    X: npt.NDArray, var_idx: int, mask: npt.NDArray | None = None
+) -> npt.NDArray:
     """Get available split values for a variable."""
     values = X[:, var_idx]
-    return values[~np.isnan(values)]
+    if mask is not None:
+        values = values[mask]
+    values = values[~np.isnan(values)]
+    if values.size == 0:
+        return values
+    return np.unique(values)
 
 
-def _draw_leaf_value(Y: npt.NDArray, leaf_sd: float) -> npt.NDArray:
+def _draw_leaf_value(
+    Y: npt.NDArray, leaf_sd: float, mask: npt.NDArray | None = None
+) -> npt.NDArray:
     """Draw a leaf value from normal distribution."""
-    return np.array([np.mean(Y) + np.random.normal(0, leaf_sd)])
+    if mask is not None and mask.any():
+        target = Y[mask]
+    else:
+        target = Y
+    return np.array([np.mean(target) + np.random.normal(0, leaf_sd)])
 
 
-def _get_all_nodes(node: DecisionTableNode) -> list[DecisionTableNode]:
-    """Get all nodes in the tree."""
-    nodes = [node]
-    for child in node.children.values():
-        nodes.extend(_get_all_nodes(child))
-    return nodes
+def _get_node_mask(
+    table: DecisionTable, target_node: DecisionTableNode, X: npt.NDArray
+) -> npt.NDArray | None:
+    """Return boolean mask of observations reaching the provided node."""
+    split_rules = table.split_rules
+
+    def _traverse(node: DecisionTableNode, mask: npt.NDArray) -> npt.NDArray | None:
+        if node is target_node:
+            return mask
+        if node.is_leaf_node():
+            return None
+
+        split_var = node.idx_split_variable
+        split_value = node.value
+        division = split_rules[split_var].divide(X[:, split_var], split_value).astype(bool)
+
+        left_mask = mask & division
+        right_mask = mask & (~division)
+
+        if 0 in node.children:
+            result = _traverse(node.children[0], left_mask)
+            if result is not None:
+                return result
+        if 1 in node.children:
+            result = _traverse(node.children[1], right_mask)
+            if result is not None:
+                return result
+        return None
+
+    full_mask = np.ones(X.shape[0], dtype=bool)
+    return _traverse(table.root, full_mask)
