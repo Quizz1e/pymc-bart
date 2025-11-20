@@ -132,18 +132,6 @@ class TargetMeanSplitRule(SplitRule):
         prior_weight: float = 1.0,
         use_preencoded_inputs: bool = False,
     ) -> None:
-        Parameters
-        ----------
-        summaries : Mapping
-            Mapping category -> (target_sum, count) or -> mean.
-        prior_mean : Optional[float]
-            Global prior mean.
-        prior_weight : float
-            Prior strength when smoothing.
-        use_preencoded_inputs : bool
-            If True, assume that feature columns already contain encoded
-            target means. In that case, this split rule behaves like a
-            regular continuous split without any per-call encoding cost.
         """
         Configure category target statistics.
 
@@ -151,13 +139,14 @@ class TargetMeanSplitRule(SplitRule):
         ----------
         summaries : Mapping
             Dictionary mapping categorical values to tuples ``(target_sum, count)``
-            or to precomputed means. Values can be anything hashable (ints/strings).
+            or to precomputed means.
         prior_mean : Optional[float]
-            Global mean used for smoothing unseen categories. If ``None``, defaults
-            to the weighted average of provided summaries. Defaults to ``None``.
+            Global prior mean used when smoothing unseen categories.
         prior_weight : float
-            Strength of the prior mean when smoothing per-category statistics.
-            Larger values shrink category means closer to ``prior_mean``.
+            Prior strength for the global mean.
+        use_preencoded_inputs : bool
+            If True, assume that feature columns already contain encoded
+            target means and skip per-call encoding.
         """
         if not summaries:
             raise ValueError("summaries must contain at least one category.")
