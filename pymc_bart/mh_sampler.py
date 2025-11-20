@@ -349,6 +349,7 @@ class MHDecisionTableSampler(ArrayStepShared):
         "variable_inclusion": (object, []),
         "move_type": (str, []),
         "accept_rate": (float, []),
+        "tune": (bool, []),
     }
 
     def __init__(
@@ -461,6 +462,7 @@ class MHDecisionTableSampler(ArrayStepShared):
         self.accept_count = 0
         self.iteration = 0
         self.model = model
+        self.tune = True
 
         shared = make_shared_replacements(initial_point, [value_bart], model)
         self.value_bart = value_bart
@@ -505,8 +507,9 @@ class MHDecisionTableSampler(ArrayStepShared):
         self.iteration += sum(1 for res in results if res["count_iteration"])
         self._update_move_probabilities(results)
 
-        # Store all tables for posterior inference
-        self.all_tables.append([t.trim() for t in self.tables])
+        # Store all tables for posterior inference (only if not tuning)
+        if not self.tune:
+            self.all_tables.append([t.trim() for t in self.tables])
 
         # Compute ensemble predictions
         ensemble_pred = np.mean(np.stack(self.table_predictions, axis=0), axis=0)
@@ -519,6 +522,7 @@ class MHDecisionTableSampler(ArrayStepShared):
             "variable_inclusion": variable_inclusion_encoded,
             "move_type": self.move_names[last_move_idx],
             "accept_rate": accept_rate,
+            "tune": self.tune,
         }
 
         return ensemble_pred, [stats]
@@ -702,7 +706,7 @@ class MHDecisionTableSampler(ArrayStepShared):
         def update_stats(step_stats):
             return {
                 key: step_stats[key]
-                for key in ("variable_inclusion", "move_type", "accept_rate")
+                for key in ("variable_inclusion", "move_type", "accept_rate", "tune")
             }
 
         return (update_stats,)
