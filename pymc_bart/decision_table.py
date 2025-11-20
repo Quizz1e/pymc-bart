@@ -199,51 +199,61 @@ class DecisionTable:
         if excluded is None:
             excluded = []
 
-        x_shape = (1,) if len(X.shape) == 1 else X.shape[:-1]
+        # Ensure X is 2D
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+
+        x_shape = X.shape[:-1] if X.ndim > 1 else (1,)
         nd_dims = (...,) + (None,) * len(x_shape)
+        n_obs = X.shape[0]
 
         p_d = (
-            np.zeros(shape + x_shape) if isinstance(shape, tuple) else np.zeros((shape,) + x_shape)
+            np.zeros(shape + x_shape) if isinstance(shape, tuple) 
+            else np.zeros((shape,) + x_shape)
         )
 
-        # Traverse the decision table
-        def _traverse(node: DecisionTableNode, weights: npt.NDArray, split_var_parent: int = -1):
+        # Use iterative traversal instead of recursion to avoid stack overflow
+        stack = [(self.root, np.ones(x_shape), -1)]
+        
+        while stack:
+            node, weights, split_var_parent = stack.pop()
+            
             if node.is_leaf_node():
                 params = node.linear_params
                 if params is None:
-                    p_d_leaf = weights * node.value[nd_dims]
+                    p_d += weights * node.value[nd_dims]
                 else:
-                    p_d_leaf = weights * (
+                    p_d += weights * (
                         params[0][nd_dims] + params[1][nd_dims] * X[..., split_var_parent]
                     )
-                return p_d_leaf
             else:
                 split_var = node.idx_split_variable
-                result = np.zeros_like(p_d)
-
+                
                 if excluded is not None and split_var in excluded:
                     # Average over both branches
-                    for child_idx, child in node.children.items():
-                        prop = child.nvalue / node.nvalue
-                        result += _traverse(child, weights * prop, split_var)
+                    for child_idx in sorted(node.children.keys()):
+                        child = node.children[child_idx]
+                        prop = child.nvalue / max(node.nvalue, 1)
+                        stack.append((child, weights * prop, split_var))
                 else:
                     # Split based on split rule
-                    to_left = (
-                        self.split_rules[split_var]
-                        .divide(X[..., split_var], node.value)
-                        .astype("float")
-                    )
+                    try:
+                        to_left = (
+                            self.split_rules[split_var]
+                            .divide(X[..., split_var], node.value)
+                            .astype("float")
+                        )
+                    except Exception as e:
+                        raise ValueError(
+                            f"Error in split rule for variable {split_var}: {e}"
+                        )
                     
                     if 0 in node.children:
-                        result += _traverse(node.children[0], weights * to_left, split_var)
+                        stack.append((node.children[0], weights * to_left, split_var))
                     if 1 in node.children:
-                        result += _traverse(node.children[1], weights * (1 - to_left), split_var)
+                        stack.append((node.children[1], weights * (1 - to_left), split_var))
 
-                return result
-
-        p_d = _traverse(self.root, np.ones(x_shape), -1)
-
-        if len(X.shape) == 1:
+        if X.shape[0] == 1:
             p_d = p_d[..., 0]
 
         return p_d
