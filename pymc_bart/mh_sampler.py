@@ -279,6 +279,7 @@ class MHDecisionTableSampler(ArrayStepShared):
         "variable_inclusion": (object, []),
         "move_type": (str, []),
         "accept_rate": (float, []),
+        "tune": (bool, []),
     }
 
     def __init__(
@@ -376,6 +377,7 @@ class MHDecisionTableSampler(ArrayStepShared):
         self.accept_count = 0
         self.iteration = 0
         self.model = model
+        self.tuning = True
 
         shared = make_shared_replacements(initial_point, [value_bart], model)
         self.value_bart = value_bart
@@ -433,9 +435,16 @@ class MHDecisionTableSampler(ArrayStepShared):
             "variable_inclusion": variable_inclusion_encoded,
             "move_type": self.move_names[last_move_idx],
             "accept_rate": accept_rate,
+            "tune": self.tuning,
         }
 
         return ensemble_pred, [stats]
+
+    def stop_tuning(self):
+        """Mark the end of the tuning period."""
+        super().stop_tuning()
+        self.tuning = False
+        self.all_tables = []
 
     def _run_single_step(
         self,
