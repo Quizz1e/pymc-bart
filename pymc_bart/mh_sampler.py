@@ -30,6 +30,7 @@ class MHDecisionTableMove:
         Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
+        context: dict | None = None,
     ) -> tuple[DecisionTable, float, dict | None]:
         """
         Propose a new tree structure.
@@ -65,6 +66,7 @@ class GrowMove(MHDecisionTableMove):
         Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
+        context: dict | None = None,
     ) -> tuple[DecisionTable, float, dict | None]:
         """Propose growing a random leaf node."""
         new_table = table.copy()
@@ -74,17 +76,25 @@ class GrowMove(MHDecisionTableMove):
             return new_table, -np.inf, None
 
         # Select random leaf node
-        leaf_idx = rng.integers(0, len(leaf_nodes))
+        leaf_idx = _select_leaf_index(leaf_nodes, rng, context)
         leaf_node, depth = leaf_nodes[leaf_idx]
 
-        node_mask = _get_node_mask(new_table, leaf_node, X)
+        node_mask = _get_node_mask(
+            new_table, leaf_node, X, cache=context.get("mask_cache") if context else None
+        )
         if node_mask is None or not np.any(node_mask):
             return new_table, -np.inf, None
 
         split_var, split_value = new_table.get_level_predicate(depth)
         if split_var is None or split_value is None:
             split_var = rng.integers(0, X.shape[1])
-            available_splits = _get_available_splits(X, split_var, node_mask)
+            feature_splits = context.get("feature_splits") if context else None
+            available_splits = _get_cached_split_candidates(
+                X,
+                split_var,
+                node_mask,
+                feature_splits[split_var] if feature_splits else None,
+            )
             if available_splits.size == 0:
                 return new_table, -np.inf, None
 
@@ -128,9 +138,9 @@ class GrowMove(MHDecisionTableMove):
 
         metadata = {
             "type": "grow",
-            "node_mask": node_mask,
-            "left_mask": left_mask,
-            "right_mask": right_mask,
+            "node_mask": node_mask.copy(),
+            "left_mask": left_mask.copy(),
+            "right_mask": right_mask.copy(),
             "old_value": old_value,
             "left_value": left_value,
             "right_value": right_value,
@@ -149,6 +159,7 @@ class PruneMove(MHDecisionTableMove):
         Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
+        context: dict | None = None,
     ) -> tuple[DecisionTable, float, dict | None]:
         """Propose pruning a random split node."""
         new_table = table.copy()
@@ -169,7 +180,9 @@ class PruneMove(MHDecisionTableMove):
         if not all(child.is_leaf_node() for child in node_to_prune.children.values()):
             return new_table, -np.inf, None
 
-        node_mask = _get_node_mask(new_table, node_to_prune, X)
+        node_mask = _get_node_mask(
+            new_table, node_to_prune, X, cache=context.get("mask_cache") if context else None
+        )
         if node_mask is None or not node_mask.any():
             return new_table, -np.inf, None
 
@@ -209,9 +222,9 @@ class PruneMove(MHDecisionTableMove):
 
         metadata = {
             "type": "prune",
-            "node_mask": node_mask,
-            "left_mask": left_mask,
-            "right_mask": right_mask,
+            "node_mask": node_mask.copy(),
+            "left_mask": left_mask.copy(),
+            "right_mask": right_mask.copy(),
             "left_value": left_child.value.copy(),
             "right_value": right_child.value.copy(),
             "new_value": new_leaf_value,
@@ -230,6 +243,7 @@ class ChangeMove(MHDecisionTableMove):
         Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
+        context: dict | None = None,
     ) -> tuple[DecisionTable, float, dict | None]:
         """Propose changing a split variable or split value."""
         new_table = table.copy()
@@ -244,7 +258,9 @@ class ChangeMove(MHDecisionTableMove):
         split_idx = rng.integers(0, len(split_nodes))
         node, depth = split_nodes[split_idx]
 
-        node_mask = _get_node_mask(new_table, node, X)
+        node_mask = _get_node_mask(
+            new_table, node, X, cache=context.get("mask_cache") if context else None
+        )
         if node_mask is None or not node_mask.any():
             return new_table, -np.inf, None
 
@@ -255,7 +271,13 @@ class ChangeMove(MHDecisionTableMove):
             new_split_var = rng.integers(0, X.shape[1])
 
         # Get available split values for new variable
-        available_splits = _get_available_splits(X, new_split_var, node_mask)
+        feature_splits = context.get("feature_splits") if context else None
+        available_splits = _get_cached_split_candidates(
+            X,
+            new_split_var,
+            node_mask,
+            feature_splits[new_split_var] if feature_splits else None,
+        )
         if available_splits.size == 0:
             return new_table, -np.inf, None
 
@@ -392,6 +414,9 @@ class MHDecisionTableSampler(ArrayStepShared):
         self.num_observations = self.X.shape[0]
         self.num_variates = self.X.shape[1]
         self.leaf_sd = leaf_sd
+        self.feature_splits = [
+            _get_available_splits(self.X, var_idx) for var_idx in range(self.num_variates)
+        ]
 
         # Normalize move probabilities
         move_probs = np.array(move_probs)
@@ -429,6 +454,7 @@ class MHDecisionTableSampler(ArrayStepShared):
         ]
 
         self.table_predictions = [t.predict(self.X) for t in self.tables]
+        self.mask_cache = [dict() for _ in range(self.m)]
         self._y_ll = self.Y.astype(np.float64, copy=False).ravel()
 
         self.all_tables = [[t.trim() for t in self.tables]]
@@ -510,12 +536,18 @@ class MHDecisionTableSampler(ArrayStepShared):
         move = self.moves[move_idx]
         reverse_idx = self.reverse_move_idx[move_idx]
 
+        context = {
+            "feature_splits": self.feature_splits,
+            "mask_cache": self.mask_cache[table_idx],
+        }
+
         proposed_table, log_hastings, move_metadata = move.propose(
             table,
             self.X,
             self.Y,
             self.leaf_sd,
             rng,
+            context,
         )
 
         if log_hastings == -np.inf:
@@ -546,6 +578,8 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         final_table = proposed_table if accepted else table
         final_prediction = new_prediction if accepted else current_prediction
+        if accepted:
+            self.mask_cache[table_idx].clear()
         split_vars = self._get_split_variables(final_table)
 
         return {
@@ -674,6 +708,56 @@ class MHDecisionTableSampler(ArrayStepShared):
         return (update_stats,)
 
 
+def _select_leaf_index(
+    leaf_nodes: list[tuple[DecisionTableNode, int]],
+    rng: np.random.Generator,
+    context: dict | None,
+) -> int:
+    """Select leaf index with weights favoring populous but shallower leaves."""
+    if not leaf_nodes:
+        raise ValueError("No leaf nodes available for selection.")
+
+    if context is None or context.get("disable_smart_leaf"):
+        return int(rng.integers(0, len(leaf_nodes)))
+
+    weights = np.array(
+        [max(node.nvalue, 1) / (1.0 + depth) for node, depth in leaf_nodes],
+        dtype=float,
+    )
+    total = weights.sum()
+    if not np.isfinite(total) or total <= 0:
+        return int(rng.integers(0, len(leaf_nodes)))
+    weights /= total
+    return int(rng.choice(len(leaf_nodes), p=weights))
+
+
+def _get_cached_split_candidates(
+    X: npt.NDArray,
+    var_idx: int,
+    mask: npt.NDArray | None,
+    cached_values: npt.NDArray | None,
+) -> npt.NDArray:
+    """Return candidate split values using cached global uniques when possible."""
+    column = X[:, var_idx]
+    if mask is None:
+        if cached_values is not None and cached_values.size:
+            return cached_values
+        return _get_available_splits(X, var_idx)
+
+    mask = _normalize_mask(mask, column.shape[0])
+    values = column[mask]
+    values = values[~np.isnan(values)]
+    if values.size <= 1:
+        return np.array([])
+    if cached_values is None or cached_values.size == 0:
+        return np.unique(values)
+
+    min_value = values.min()
+    max_value = values.max()
+    valid = cached_values[(cached_values > min_value) & (cached_values < max_value)]
+    return valid
+
+
 def _get_available_splits(
     X: npt.NDArray, var_idx: int, mask: npt.NDArray | None = None
 ) -> npt.NDArray:
@@ -704,9 +788,19 @@ def _draw_leaf_value(
 
 
 def _get_node_mask(
-    table: DecisionTable, target_node: DecisionTableNode, X: npt.NDArray
+    table: DecisionTable,
+    target_node: DecisionTableNode,
+    X: npt.NDArray,
+    cache: dict | None = None,
 ) -> npt.NDArray | None:
     """Return boolean mask of observations reaching the provided node."""
+    node_path = None
+    if cache is not None:
+        node_path = _get_node_path(table, target_node)
+        cached = cache.get(node_path)
+        if cached is not None:
+            return cached
+
     split_rules = table.split_rules
     n_obs = X.shape[0]
 
@@ -738,7 +832,22 @@ def _get_node_mask(
     result = _traverse(table.root, full_mask)
     if result is None:
         return None
-    return _normalize_mask(result, n_obs)
+    result = _normalize_mask(result, n_obs)
+    if cache is not None and node_path is not None:
+        cache[node_path] = result
+    return result
+
+
+def _get_node_path(table: DecisionTable, target_node: DecisionTableNode) -> tuple | None:
+    """Return tuple describing path from root to target node."""
+    stack: list[tuple[DecisionTableNode, tuple]] = [(table.root, ())]
+    while stack:
+        node, path = stack.pop()
+        if node is target_node:
+            return path
+        for child_idx, child in node.children.items():
+            stack.append((child, path + (child_idx,)))
+    return None
 
 
 def _ensure_split_array(value) -> npt.NDArray:
