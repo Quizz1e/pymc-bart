@@ -13,7 +13,7 @@ from pytensor.tensor.variable import Variable
 
 from pymc_bart.bart import BARTRV
 from pymc_bart.decision_table import DecisionTable, DecisionTableNode
-from pymc_bart.split_rules import ContinuousSplitRule
+from pymc_bart.split_rules import ContinuousSplitRule, SplitRule
 from pymc_bart.utils import _encode_vi
 
 
@@ -89,7 +89,7 @@ class GrowMove(MHDecisionTableMove):
             split_value = split_value.copy()
 
         split_rule = table.split_rules[split_var]
-        division = split_rule.divide(X[:, split_var], split_value).astype(bool)
+        division = _split_decision(split_rule, X[:, split_var], split_value)
 
         left_mask = node_mask & division
         right_mask = node_mask & (~division)
@@ -219,7 +219,7 @@ class ChangeMove(MHDecisionTableMove):
         split_value = _ensure_split_array(split_value_raw)
 
         split_rule = table.split_rules[new_split_var]
-        division = split_rule.divide(X[:, new_split_var], split_value).astype(bool)
+        division = _split_decision(split_rule, X[:, new_split_var], split_value)
         left_mask = node_mask & division
         right_mask = node_mask & (~division)
 
@@ -476,6 +476,7 @@ def _get_available_splits(
     """Get available split values for a variable."""
     values = X[:, var_idx]
     if mask is not None:
+        mask = _normalize_mask(mask, values.shape[0])
         values = values[mask]
     values = values[~np.isnan(values)]
     if values.size == 0:
@@ -488,6 +489,7 @@ def _draw_leaf_value(
 ) -> npt.NDArray:
     """Draw a leaf value from normal distribution."""
     if mask is not None and mask.any():
+        mask = _normalize_mask(mask, Y.shape[0])
         target = Y[mask]
     else:
         target = Y
@@ -499,8 +501,10 @@ def _get_node_mask(
 ) -> npt.NDArray | None:
     """Return boolean mask of observations reaching the provided node."""
     split_rules = table.split_rules
+    n_obs = X.shape[0]
 
     def _traverse(node: DecisionTableNode, mask: npt.NDArray) -> npt.NDArray | None:
+        mask = _normalize_mask(mask, n_obs)
         if node is target_node:
             return mask
         if node.is_leaf_node():
@@ -508,7 +512,7 @@ def _get_node_mask(
 
         split_var = node.idx_split_variable
         split_value = node.value
-        division = split_rules[split_var].divide(X[:, split_var], split_value).astype(bool)
+        division = _split_decision(split_rules[split_var], X[:, split_var], split_value)
 
         left_mask = mask & division
         right_mask = mask & (~division)
@@ -523,8 +527,11 @@ def _get_node_mask(
                 return result
         return None
 
-    full_mask = np.ones(X.shape[0], dtype=bool)
-    return _traverse(table.root, full_mask)
+    full_mask = np.ones(n_obs, dtype=bool)
+    result = _traverse(table.root, full_mask)
+    if result is None:
+        return None
+    return _normalize_mask(result, n_obs)
 
 
 def _ensure_split_array(value) -> npt.NDArray:
@@ -535,3 +542,24 @@ def _ensure_split_array(value) -> npt.NDArray:
     if arr.ndim == 0:
         arr = arr[None]
     return arr
+
+
+def _normalize_mask(mask: npt.NDArray, length: int) -> npt.NDArray:
+    """Ensure mask is 1-D boolean array of requested length."""
+    mask_arr = np.asarray(mask, dtype=bool)
+    mask_arr = np.squeeze(mask_arr)
+    mask_arr = mask_arr.reshape(-1)
+    if mask_arr.size != length:
+        raise ValueError(
+            f"Mask has size {mask_arr.size}, expected {length}. "
+            "Split rule produced incompatible shape."
+        )
+    return mask_arr
+
+
+def _split_decision(
+    split_rule: SplitRule, feature_values: npt.NDArray, split_value: npt.NDArray
+) -> npt.NDArray:
+    """Evaluate split rule and normalize mask shape."""
+    division = split_rule.divide(feature_values, split_value)
+    return _normalize_mask(division, feature_values.shape[0])
