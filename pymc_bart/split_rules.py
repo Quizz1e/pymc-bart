@@ -118,6 +118,10 @@ class TargetMeanSplitRule(SplitRule):
     _value_count: dict = {}
     _prior_mean: float = 0.0
     _prior_weight: float = 1.0
+    _value_to_mean: dict = {}
+    _lut_keys: np.ndarray | None = None
+    _lut_means: np.ndarray | None = None
+    _lut_numeric: bool = False
 
     @classmethod
     def set_target_statistics(
@@ -179,6 +183,33 @@ class TargetMeanSplitRule(SplitRule):
         else:
             cls._prior_mean = 0.0
 
+        # Precompute smoothed means for every category for quick lookup.
+        value_to_mean = {}
+        for key, target_sum in sums.items():
+            count = counts[key]
+            mean = (target_sum + cls._prior_mean * cls._prior_weight) / (
+                count + cls._prior_weight
+            )
+            value_to_mean[key] = mean
+        cls._value_to_mean = value_to_mean
+
+        # Attempt to build a numeric lookup table for fast vectorized encoding.
+        try:
+            ordered_keys = np.array(sorted(value_to_mean.keys()))
+            cls._lut_numeric = ordered_keys.dtype.kind in {"i", "u", "f"}
+            if cls._lut_numeric:
+                cls._lut_keys = ordered_keys
+                cls._lut_means = np.array(
+                    [value_to_mean[key] for key in ordered_keys], dtype=np.float64
+                )
+            else:
+                cls._lut_keys = None
+                cls._lut_means = None
+        except TypeError:
+            cls._lut_numeric = False
+            cls._lut_keys = None
+            cls._lut_means = None
+
     @classmethod
     def _encode_with_target_mean(cls, values: np.ndarray) -> np.ndarray:
         if not cls._value_sum:
@@ -186,16 +217,21 @@ class TargetMeanSplitRule(SplitRule):
                 "TargetMeanSplitRule: call set_target_statistics before using this rule."
             )
 
-        encoded = np.empty(values.shape[0], dtype=np.float64)
-        for idx, val in enumerate(values):
-            target_sum = cls._value_sum.get(val)
-            count = cls._value_count.get(val)
-            if target_sum is None or count is None or count <= 0:
-                encoded[idx] = cls._prior_mean
-            else:
-                encoded[idx] = (target_sum + cls._prior_mean * cls._prior_weight) / (
-                    count + cls._prior_weight
-                )
+        values_arr = np.asarray(values)
+        encoded = np.empty(values_arr.shape[0], dtype=np.float64)
+
+        if cls._lut_numeric and np.issubdtype(values_arr.dtype, np.number):
+            values_cast = values_arr.astype(cls._lut_keys.dtype, copy=False)
+            idx = np.searchsorted(cls._lut_keys, values_cast)
+            valid = (idx >= 0) & (idx < cls._lut_keys.size)
+            valid &= cls._lut_keys[idx] == values_cast
+            encoded[valid] = cls._lut_means[idx[valid]]
+            encoded[~valid] = cls._prior_mean
+            return encoded
+
+        # Fallback for non-numeric categories
+        for i, val in enumerate(values_arr):
+            encoded[i] = cls._value_to_mean.get(val, cls._prior_mean)
         return encoded
 
     @staticmethod
