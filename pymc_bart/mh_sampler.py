@@ -606,6 +606,7 @@ class MHDecisionTableSampler(ArrayStepShared):
             return None
 
         new_pred = np.array(current_prediction, copy=True)
+        flat_pred = new_pred.reshape(-1)
         node_mask = metadata["node_mask"]
         left_mask = metadata["left_mask"]
         right_mask = metadata["right_mask"]
@@ -615,19 +616,19 @@ class MHDecisionTableSampler(ArrayStepShared):
             left_value = float(np.squeeze(metadata["left_value"]))
             right_value = float(np.squeeze(metadata["right_value"]))
 
-            new_pred[node_mask] -= old_value
-            new_pred[left_mask] += left_value
-            new_pred[right_mask] += right_value
-            return new_pred
+            flat_pred[node_mask] -= old_value
+            flat_pred[left_mask] += left_value
+            flat_pred[right_mask] += right_value
+            return flat_pred.reshape(new_pred.shape)
 
         if move_type == "prune":
             new_value = float(np.squeeze(metadata["new_value"]))
             left_value = float(np.squeeze(metadata["left_value"]))
             right_value = float(np.squeeze(metadata["right_value"]))
 
-            new_pred[left_mask] += new_value - left_value
-            new_pred[right_mask] += new_value - right_value
-            return new_pred
+            flat_pred[left_mask] += new_value - left_value
+            flat_pred[right_mask] += new_value - right_value
+            return flat_pred.reshape(new_pred.shape)
 
         return None
 
