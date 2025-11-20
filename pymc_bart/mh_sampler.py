@@ -30,7 +30,7 @@ class MHDecisionTableMove:
         Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
-    ) -> tuple[DecisionTable, float]:
+    ) -> tuple[DecisionTable, float, dict | None]:
         """
         Propose a new tree structure.
 
@@ -49,8 +49,8 @@ class MHDecisionTableMove:
 
         Returns
         -------
-        tuple[DecisionTable, float]
-            New table and log Hastings ratio
+        tuple[DecisionTable, float, dict | None]
+            New table, log Hastings ratio, and optional metadata
         """
         raise NotImplementedError
 
@@ -65,13 +65,13 @@ class GrowMove(MHDecisionTableMove):
         Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
-    ) -> tuple[DecisionTable, float]:
+    ) -> tuple[DecisionTable, float, dict | None]:
         """Propose growing a random leaf node."""
         new_table = table.copy()
         leaf_nodes = new_table.get_leaf_nodes(with_depth=True)
 
         if not leaf_nodes:
-            return new_table, -np.inf
+            return new_table, -np.inf, None
 
         # Select random leaf node
         leaf_idx = rng.integers(0, len(leaf_nodes))
@@ -79,18 +79,18 @@ class GrowMove(MHDecisionTableMove):
 
         node_mask = _get_node_mask(new_table, leaf_node, X)
         if node_mask is None or not np.any(node_mask):
-            return new_table, -np.inf
+            return new_table, -np.inf, None
 
         split_var, split_value = new_table.get_level_predicate(depth)
         if split_var is None or split_value is None:
             split_var = rng.integers(0, X.shape[1])
             available_splits = _get_available_splits(X, split_var, node_mask)
             if available_splits.size == 0:
-                return new_table, -np.inf
+                return new_table, -np.inf, None
 
             split_value_raw = table.split_rules[split_var].get_split_value(available_splits)
             if split_value_raw is None:
-                return new_table, -np.inf
+                return new_table, -np.inf, None
             split_value = _ensure_split_array(split_value_raw)
         else:
             split_value = split_value.copy()
@@ -102,10 +102,11 @@ class GrowMove(MHDecisionTableMove):
         right_mask = node_mask & (~division)
 
         if not left_mask.any() or not right_mask.any():
-            return new_table, -np.inf
+            return new_table, -np.inf, None
 
         left_value = _draw_leaf_value(Y, leaf_sd, left_mask, rng)
         right_value = _draw_leaf_value(Y, leaf_sd, right_mask, rng)
+        old_value = leaf_node.value.copy()
 
         # Grow the leaf
         new_table.grow_leaf_node(
@@ -125,7 +126,17 @@ class GrowMove(MHDecisionTableMove):
 
         log_alpha = np.log(max(n_split_nodes, 1)) - np.log(n_leaf_nodes)
 
-        return new_table, log_alpha
+        metadata = {
+            "type": "grow",
+            "node_mask": node_mask,
+            "left_mask": left_mask,
+            "right_mask": right_mask,
+            "old_value": old_value,
+            "left_value": left_value,
+            "right_value": right_value,
+        }
+
+        return new_table, log_alpha, metadata
 
 
 class PruneMove(MHDecisionTableMove):
@@ -138,7 +149,7 @@ class PruneMove(MHDecisionTableMove):
         Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
-    ) -> tuple[DecisionTable, float]:
+    ) -> tuple[DecisionTable, float, dict | None]:
         """Propose pruning a random split node."""
         new_table = table.copy()
 
@@ -146,7 +157,7 @@ class PruneMove(MHDecisionTableMove):
         split_nodes = new_table.get_split_nodes(with_depth=True)
 
         if not split_nodes:
-            return new_table, -np.inf
+            return new_table, -np.inf, None
 
         n_split_nodes_before = len(split_nodes)
 
@@ -156,11 +167,28 @@ class PruneMove(MHDecisionTableMove):
 
         # Check if both children are leaves
         if not all(child.is_leaf_node() for child in node_to_prune.children.values()):
-            return new_table, -np.inf
+            return new_table, -np.inf, None
 
         node_mask = _get_node_mask(new_table, node_to_prune, X)
         if node_mask is None or not node_mask.any():
-            return new_table, -np.inf
+            return new_table, -np.inf, None
+
+        split_var = node_to_prune.idx_split_variable
+        split_value = node_to_prune.value.copy()
+        left_child = node_to_prune.children.get(0)
+        right_child = node_to_prune.children.get(1)
+
+        if left_child is None or right_child is None:
+            return new_table, -np.inf, None
+
+        division = _split_decision(
+            table.split_rules[split_var], X[:, split_var], split_value
+        )
+        left_mask = node_mask & division
+        right_mask = node_mask & (~division)
+
+        if not left_mask.any() or not right_mask.any():
+            return new_table, -np.inf, None
 
         # Draw new leaf value
         new_leaf_value = _draw_leaf_value(Y, leaf_sd, node_mask, rng)
@@ -175,11 +203,21 @@ class PruneMove(MHDecisionTableMove):
         # Compute Hastings ratio (reverse grow selects among new leaves)
         n_leaf_nodes_after = new_table.count_leaf_nodes()
         if n_leaf_nodes_after <= 0 or n_split_nodes_before <= 0:
-            return new_table, -np.inf
+            return new_table, -np.inf, None
 
         log_alpha = np.log(n_leaf_nodes_after) - np.log(n_split_nodes_before)
 
-        return new_table, log_alpha
+        metadata = {
+            "type": "prune",
+            "node_mask": node_mask,
+            "left_mask": left_mask,
+            "right_mask": right_mask,
+            "left_value": left_child.value.copy(),
+            "right_value": right_child.value.copy(),
+            "new_value": new_leaf_value,
+        }
+
+        return new_table, log_alpha, metadata
 
 
 class ChangeMove(MHDecisionTableMove):
@@ -192,7 +230,7 @@ class ChangeMove(MHDecisionTableMove):
         Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
-    ) -> tuple[DecisionTable, float]:
+    ) -> tuple[DecisionTable, float, dict | None]:
         """Propose changing a split variable or split value."""
         new_table = table.copy()
 
@@ -200,7 +238,7 @@ class ChangeMove(MHDecisionTableMove):
         split_nodes = new_table.get_split_nodes(with_depth=True)
 
         if not split_nodes:
-            return new_table, -np.inf
+            return new_table, -np.inf, None
 
         # Select random split node
         split_idx = rng.integers(0, len(split_nodes))
@@ -208,7 +246,7 @@ class ChangeMove(MHDecisionTableMove):
 
         node_mask = _get_node_mask(new_table, node, X)
         if node_mask is None or not node_mask.any():
-            return new_table, -np.inf
+            return new_table, -np.inf, None
 
         # Change split variable (with some probability keep the same)
         if rng.random() < 0.5:
@@ -219,12 +257,12 @@ class ChangeMove(MHDecisionTableMove):
         # Get available split values for new variable
         available_splits = _get_available_splits(X, new_split_var, node_mask)
         if available_splits.size == 0:
-            return new_table, -np.inf
+            return new_table, -np.inf, None
 
         # Select split value
         split_value_raw = table.split_rules[new_split_var].get_split_value(available_splits)
         if split_value_raw is None:
-            return new_table, -np.inf
+            return new_table, -np.inf, None
         split_value = _ensure_split_array(split_value_raw)
 
         split_rule = table.split_rules[new_split_var]
@@ -233,7 +271,7 @@ class ChangeMove(MHDecisionTableMove):
         right_mask = node_mask & (~division)
 
         if not left_mask.any() or not right_mask.any():
-            return new_table, -np.inf
+            return new_table, -np.inf, None
 
         # Update node + depth predicate
         new_table.update_level_predicate(
@@ -245,7 +283,11 @@ class ChangeMove(MHDecisionTableMove):
         # Hastings ratio = 1 (symmetric proposal)
         log_alpha = 0.0
 
-        return new_table, log_alpha
+        metadata = {
+            "type": "change",
+        }
+
+        return new_table, log_alpha, metadata
 
 
 class MHDecisionTableSampler(ArrayStepShared):
@@ -468,7 +510,7 @@ class MHDecisionTableSampler(ArrayStepShared):
         move = self.moves[move_idx]
         reverse_idx = self.reverse_move_idx[move_idx]
 
-        proposed_table, log_hastings = move.propose(
+        proposed_table, log_hastings, move_metadata = move.propose(
             table,
             self.X,
             self.Y,
@@ -487,7 +529,11 @@ class MHDecisionTableSampler(ArrayStepShared):
                 "count_iteration": False,
             }
 
-        new_prediction = proposed_table.predict(self.X)
+        new_prediction = self._apply_prediction_update(
+            current_prediction, move_metadata
+        )
+        if new_prediction is None:
+            new_prediction = proposed_table.predict(self.X)
         log_likelihood_ratio = self._compute_log_likelihood_ratio(
             current_prediction, new_prediction
         )
@@ -545,6 +591,45 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         _traverse(table.root)
         return split_vars
+
+    def _apply_prediction_update(
+        self,
+        current_prediction: npt.NDArray,
+        metadata: dict | None,
+    ) -> npt.NDArray | None:
+        """Return updated prediction using localized move metadata."""
+        if metadata is None:
+            return None
+
+        move_type = metadata.get("type")
+        if move_type not in {"grow", "prune"}:
+            return None
+
+        new_pred = np.array(current_prediction, copy=True)
+        node_mask = metadata["node_mask"]
+        left_mask = metadata["left_mask"]
+        right_mask = metadata["right_mask"]
+
+        if move_type == "grow":
+            old_value = float(np.squeeze(metadata["old_value"]))
+            left_value = float(np.squeeze(metadata["left_value"]))
+            right_value = float(np.squeeze(metadata["right_value"]))
+
+            new_pred[node_mask] -= old_value
+            new_pred[left_mask] += left_value
+            new_pred[right_mask] += right_value
+            return new_pred
+
+        if move_type == "prune":
+            new_value = float(np.squeeze(metadata["new_value"]))
+            left_value = float(np.squeeze(metadata["left_value"]))
+            right_value = float(np.squeeze(metadata["right_value"]))
+
+            new_pred[left_mask] += new_value - left_value
+            new_pred[right_mask] += new_value - right_value
+            return new_pred
+
+        return None
 
     def _update_move_probabilities(self, results: list[dict]) -> None:
         """Adapt move probabilities using recent acceptance outcomes."""
