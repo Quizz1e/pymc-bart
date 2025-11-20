@@ -122,7 +122,6 @@ class TargetMeanSplitRule(SplitRule):
     _lut_keys: np.ndarray | None = None
     _lut_means: np.ndarray | None = None
     _lut_numeric: bool = False
-    _use_preencoded_inputs: bool = False
 
     @classmethod
     def set_target_statistics(
@@ -130,20 +129,7 @@ class TargetMeanSplitRule(SplitRule):
         summaries: Mapping,
         prior_mean: float | None = None,
         prior_weight: float = 1.0,
-        use_preencoded_inputs: bool = False,
     ) -> None:
-        Parameters
-        ----------
-        summaries : Mapping
-            Mapping category -> (target_sum, count) or -> mean.
-        prior_mean : Optional[float]
-            Global prior mean.
-        prior_weight : float
-            Prior strength when smoothing.
-        use_preencoded_inputs : bool
-            If True, assume that feature columns already contain encoded
-            target means. In that case, this split rule behaves like a
-            regular continuous split without any per-call encoding cost.
         """
         Configure category target statistics.
 
@@ -206,7 +192,6 @@ class TargetMeanSplitRule(SplitRule):
             )
             value_to_mean[key] = mean
         cls._value_to_mean = value_to_mean
-        cls._use_preencoded_inputs = bool(use_preencoded_inputs)
 
         # Attempt to build a numeric lookup table for fast vectorized encoding.
         try:
@@ -249,24 +234,9 @@ class TargetMeanSplitRule(SplitRule):
             encoded[i] = cls._value_to_mean.get(val, cls._prior_mean)
         return encoded
 
-    @classmethod
-    def transform(cls, values: np.ndarray) -> np.ndarray:
-        """Convenience helper to precompute encoded feature columns."""
-        return cls._encode_with_target_mean(np.asarray(values))
-
-    @classmethod
-    def use_preencoded_inputs(cls, flag: bool = True) -> None:
-        """Toggle fast-path mode that expects already-encoded feature values."""
-        cls._use_preencoded_inputs = bool(flag)
-
     @staticmethod
     def get_split_value(available_splitting_values):
-        if TargetMeanSplitRule._use_preencoded_inputs:
-            encoded = np.asarray(available_splitting_values, dtype=np.float64)
-        else:
-            encoded = TargetMeanSplitRule._encode_with_target_mean(
-                available_splitting_values
-            )
+        encoded = TargetMeanSplitRule._encode_with_target_mean(available_splitting_values)
         if encoded.size <= 1 or np.all(encoded == encoded[0]):
             return None
         idx_selected = int(np.random.random() * encoded.size)
@@ -274,10 +244,5 @@ class TargetMeanSplitRule(SplitRule):
 
     @staticmethod
     def divide(available_splitting_values, split_value):
-        if TargetMeanSplitRule._use_preencoded_inputs:
-            encoded = np.asarray(available_splitting_values, dtype=np.float64)
-        else:
-            encoded = TargetMeanSplitRule._encode_with_target_mean(
-                available_splitting_values
-            )
+        encoded = TargetMeanSplitRule._encode_with_target_mean(available_splitting_values)
         return encoded <= split_value
