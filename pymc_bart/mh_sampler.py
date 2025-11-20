@@ -457,10 +457,6 @@ class MHDecisionTableSampler(ArrayStepShared):
         self.table_predictions = [t.predict(self.X) for t in self.tables]
         self.mask_cache = [dict() for _ in range(self.m)]
         self._y_ll = self.Y.astype(np.float64, copy=False).ravel()
-        
-        # Compute initial ensemble prediction
-        self.ensemble_pred = np.mean(np.stack(self.table_predictions, axis=0), axis=0)
-        self.prev_ensemble_pred = self.ensemble_pred.copy()
 
         self.all_tables = [[t.trim() for t in self.tables]]
         self.accept_count = 0
@@ -470,10 +466,6 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         shared = make_shared_replacements(initial_point, [value_bart], model)
         self.value_bart = value_bart
-        
-        # Get sigma from model if available, otherwise use a default
-        # We'll estimate it from residuals during sampling
-        self.sigma_estimate = None
 
         super().__init__([value_bart], shared, **kwargs)
 
@@ -519,20 +511,8 @@ class MHDecisionTableSampler(ArrayStepShared):
         if not self.tune:
             self.all_tables.append([t.trim() for t in self.tables])
 
-        # Update ensemble predictions after all tables are updated
-        # Save previous for next iteration
-        self.prev_ensemble_pred = self.ensemble_pred.copy()
-        self.ensemble_pred = np.mean(np.stack(self.table_predictions, axis=0), axis=0)
-        ensemble_pred = self.ensemble_pred
-        
-        # Update sigma estimate from current residuals (adaptive)
-        if self.sigma_estimate is not None:
-            current_residuals = self._y_ll - self.ensemble_pred
-            # Use exponential moving average to update sigma
-            new_sigma = np.std(current_residuals)
-            if new_sigma > 1e-6:
-                # Smooth update (0.1 weight for new estimate)
-                self.sigma_estimate = 0.9 * self.sigma_estimate + 0.1 * new_sigma
+        # Compute ensemble predictions
+        ensemble_pred = np.mean(np.stack(self.table_predictions, axis=0), axis=0)
 
         accept_rate = np.mean(accept_rates) if accept_rates else 0.0
         variable_inclusion_encoded = _encode_vi(variable_inclusion.tolist())
@@ -590,36 +570,8 @@ class MHDecisionTableSampler(ArrayStepShared):
         )
         if new_prediction is None:
             new_prediction = proposed_table.predict(self.X)
-        
-        # Ensure predictions are 1D
-        if new_prediction.ndim > 1:
-            new_prediction = new_prediction.ravel()
-        if current_prediction.ndim > 1:
-            current_prediction = current_prediction.ravel()
-        
-        # Compute residual: Y - sum of all other tables
-        # Use previous iteration's ensemble to compute residual
-        # For table i: residual = Y - (prev_ensemble - table_i/m)
-        # Old ensemble prediction (with current table from prev iteration)
-        old_ensemble = self.prev_ensemble_pred.copy()
-        # New ensemble prediction (replacing current table with new prediction)
-        new_ensemble = old_ensemble - (current_prediction / self.m) + (new_prediction / self.m)
-        
-        # Compute residuals
-        residual_old = self._y_ll - old_ensemble
-        residual_new = self._y_ll - new_ensemble
-        
-        # Estimate sigma from residuals if not set (use median absolute deviation for robustness)
-        if self.sigma_estimate is None:
-            mad = np.median(np.abs(residual_old - np.median(residual_old)))
-            self.sigma_estimate = 1.4826 * mad  # Convert MAD to std estimate
-            if self.sigma_estimate < 1e-6:
-                self.sigma_estimate = np.std(residual_old)
-            if self.sigma_estimate < 1e-6:
-                self.sigma_estimate = 1.0
-        
         log_likelihood_ratio = self._compute_log_likelihood_ratio(
-            residual_old, residual_new, self.sigma_estimate
+            current_prediction, new_prediction
         )
 
         log_move_ratio = np.log(self.move_probs[reverse_idx]) - np.log(
@@ -646,23 +598,23 @@ class MHDecisionTableSampler(ArrayStepShared):
 
     def _compute_log_likelihood_ratio(
         self,
-        old_residual: npt.NDArray,
-        new_residual: npt.NDArray,
-        sigma: float,
+        old_pred: npt.NDArray,
+        new_pred: npt.NDArray,
     ) -> float:
-        """Compute log likelihood ratio for MH acceptance using residuals."""
-        old_flat = np.asarray(old_residual, dtype=np.float64).ravel()
-        new_flat = np.asarray(new_residual, dtype=np.float64).ravel()
+        """Compute log likelihood ratio for MH acceptance."""
+        old_flat = np.asarray(old_pred, dtype=np.float64).ravel()
+        new_flat = np.asarray(new_pred, dtype=np.float64).ravel()
 
-        if old_flat.shape[0] != new_flat.shape[0]:
+        if old_flat.shape[0] != self._y_ll.shape[0] or new_flat.shape[0] != self._y_ll.shape[0]:
             raise ValueError(
-                "Residuals must have the same size."
+                "Predictions and observations must share the same flattened size."
             )
 
-        return _log_likelihood_ratio_numba_residuals(
+        return _log_likelihood_ratio_numba(
+            self._y_ll,
             old_flat,
             new_flat,
-            float(sigma),
+            float(self.leaf_sd),
         )
 
     def _get_split_variables(self, table: DecisionTable) -> list[int]:
@@ -949,20 +901,4 @@ def _log_likelihood_ratio_numba(
         diff_new = y[i] - new_pred[i]
         sse_old += diff_old * diff_old
         sse_new += diff_new * diff_new
-    return 0.5 * (sse_old - sse_new) * inv_var
-
-
-@njit(cache=True, fastmath=True)
-def _log_likelihood_ratio_numba_residuals(
-    old_residual: np.ndarray,
-    new_residual: np.ndarray,
-    sigma: float,
-) -> float:
-    """Numba-accelerated log-likelihood ratio using residuals."""
-    inv_var = 1.0 / (sigma * sigma)
-    sse_old = 0.0
-    sse_new = 0.0
-    for i in range(old_residual.size):
-        sse_old += old_residual[i] * old_residual[i]
-        sse_new += new_residual[i] * new_residual[i]
     return 0.5 * (sse_old - sse_new) * inv_var
