@@ -1,8 +1,6 @@
 """Metropolis-Hastings sampler for Decision Tables."""
 
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 
 import numpy as np
 import numpy.typing as npt
@@ -113,7 +111,7 @@ class GrowMove(MHDecisionTableMove):
         new_table.grow_leaf_node(
             leaf_node=leaf_node,
             selected_predictor=split_var,
-            split_value=split_value,
+            split_value=np.array([split_value]),
             left_value=left_value,
             right_value=right_value,
             left_nvalue=int(left_mask.sum()),
@@ -374,11 +372,10 @@ class MHDecisionTableSampler(ArrayStepShared):
         self.table_predictions = [t.predict(self.X) for t in self.tables]
         self._y_ll = self.Y.astype(np.float64, copy=False).ravel()
 
-        self.all_tables: list[list[DecisionTable]] = []
+        self.all_tables = [[t.trim() for t in self.tables]]
         self.accept_count = 0
         self.iteration = 0
         self.model = model
-        self.tuning = True
 
         shared = make_shared_replacements(initial_point, [value_bart], model)
         self.value_bart = value_bart
@@ -422,8 +419,8 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         self.iteration += sum(1 for res in results if res["count_iteration"])
 
-        if not self.tuning:
-            self.all_tables.append([t.trim() for t in self.tables])
+        # Store all tables for posterior inference
+        self.all_tables.append([t.trim() for t in self.tables])
 
         # Compute ensemble predictions
         ensemble_pred = np.mean(np.stack(self.table_predictions, axis=0), axis=0)
@@ -439,12 +436,6 @@ class MHDecisionTableSampler(ArrayStepShared):
         }
 
         return ensemble_pred, [stats]
-
-    def stop_tuning(self) -> None:
-        """Mark the end of the tuning period and reset stored samples."""
-        super().stop_tuning()
-        self.tuning = False
-        self.all_tables = []
 
     def _run_single_step(
         self,
@@ -671,167 +662,3 @@ def _log_likelihood_ratio_numba(
         sse_old += diff_old * diff_old
         sse_new += diff_new * diff_new
     return 0.5 * (sse_old - sse_new) * inv_var
-
-
-@dataclass
-class BatchDiagnostics:
-    """Summary statistics for one batch of MH updates."""
-
-    batch_index: int
-    draws_completed: int
-    ensemble_mean: float
-    ensemble_std: float
-    accept_rate: float
-    converged: bool
-    diagnostics: dict
-
-
-class ConvergenceController:
-    """Heuristic controller that decides when to stop batched sampling."""
-
-    def __init__(
-        self,
-        window: int = 5,
-        tolerance: float = 1e-3,
-        min_accept_rate: float = 0.02,
-        max_rhat: float = 1.05,
-    ) -> None:
-        if window < 2:
-            raise ValueError("window must be >= 2")
-        self.window = window
-        self.tolerance = tolerance
-        self.min_accept_rate = min_accept_rate
-        self.max_rhat = max_rhat
-        self._summary_buffer: deque[float] = deque(maxlen=window)
-        self._accept_buffer: deque[float] = deque(maxlen=window)
-
-    def update(self, summary_stat: float, accept_rate: float) -> tuple[bool, dict]:
-        """Update controller state and report convergence decision."""
-        self._summary_buffer.append(float(summary_stat))
-        self._accept_buffer.append(float(accept_rate))
-
-        diagnostics = {
-            "window": len(self._summary_buffer),
-            "mean_prediction": float(np.mean(self._summary_buffer)),
-            "mean_accept_rate": float(np.mean(self._accept_buffer)),
-            "min_accept_rate": float(min(self._accept_buffer)),
-            "delta": np.inf,
-            "rhat": np.inf,
-        }
-
-        if len(self._summary_buffer) < self.window:
-            return False, diagnostics
-
-        mean_summary = diagnostics["mean_prediction"]
-        latest = self._summary_buffer[-1]
-        base = np.maximum(np.abs(mean_summary), 1e-12)
-        diagnostics["delta"] = float(np.abs(latest - mean_summary) / base)
-        diagnostics["rhat"] = float(self._estimate_rhat(np.asarray(self._summary_buffer)))
-
-        converged = (
-            diagnostics["delta"] <= self.tolerance
-            and diagnostics["min_accept_rate"] >= self.min_accept_rate
-            and diagnostics["rhat"] <= self.max_rhat
-        )
-
-        return bool(converged), diagnostics
-
-    def _estimate_rhat(self, values: np.ndarray) -> float:
-        """Approximate R-hat by splitting the window into two pseudo-chains."""
-        if values.size < 4:
-            return float("inf")
-
-        half = values.size // 2
-        first = values[:half]
-        second = values[-half:]
-        if first.size < 2:
-            return float("inf")
-
-        n = first.size
-        mean_first = float(np.mean(first))
-        mean_second = float(np.mean(second))
-        mean_overall = float(np.mean(values))
-
-        var_first = float(np.var(first, ddof=1))
-        var_second = float(np.var(second, ddof=1))
-        W = 0.5 * (var_first + var_second)
-        if W <= 0:
-            return 1.0
-
-        B = n * ((mean_first - mean_overall) ** 2 + (mean_second - mean_overall) ** 2)
-        var_hat = ((n - 1) / n) * W + (B / n)
-        return float(np.sqrt(np.maximum(var_hat / W, 1.0)))
-
-
-def run_batched_sampling(
-    step: "MHDecisionTableSampler",
-    draws_per_batch: int = 200,
-    max_batches: int = 50,
-    controller: ConvergenceController | None = None,
-) -> tuple[list[BatchDiagnostics], ConvergenceController]:
-    """
-    Run MH sampler in batches until convergence controller signals stop.
-
-    Parameters
-    ----------
-    step : MHDecisionTableSampler
-        Initialized sampler instance (typically created inside a PyMC model).
-    draws_per_batch : int
-        Number of MH updates per batch before evaluating diagnostics.
-    max_batches : int
-        Maximum number of batches to execute.
-    controller : Optional[ConvergenceController]
-        Controller that evaluates convergence. Defaults to ConvergenceController().
-
-    Returns
-    -------
-    tuple
-        (diagnostics_history, controller)
-
-    Notes
-    -----
-    This helper executes the sampler outside of PyMC's driver in order to
-    support dynamic stopping. When used together with a PyMC model, ensure that
-    other step methods are coordinated accordingly.
-    """
-    if controller is None:
-        controller = ConvergenceController()
-
-    diagnostics_history: list[BatchDiagnostics] = []
-    total_draws = 0
-
-    if getattr(step, "tuning", False):
-        step.stop_tuning()
-
-    for batch_idx in range(max_batches):
-        batch_accept_rates = []
-        ensemble_pred = None
-
-        for _ in range(draws_per_batch):
-            ensemble_pred, stats = step.astep(None)
-            batch_accept_rates.append(stats[0]["accept_rate"])
-
-        total_draws += draws_per_batch
-        accept_rate = float(np.mean(batch_accept_rates)) if batch_accept_rates else 0.0
-
-        if ensemble_pred is None:
-            raise RuntimeError("Sampler did not produce any predictions in this batch.")
-
-        summary_stat = float(np.mean(ensemble_pred))
-        converged, diag = controller.update(summary_stat, accept_rate)
-
-        batch_diag = BatchDiagnostics(
-            batch_index=batch_idx,
-            draws_completed=total_draws,
-            ensemble_mean=summary_stat,
-            ensemble_std=float(np.std(ensemble_pred)),
-            accept_rate=accept_rate,
-            converged=converged,
-            diagnostics=diag,
-        )
-        diagnostics_history.append(batch_diag)
-
-        if converged:
-            break
-
-    return diagnostics_history, controller
