@@ -47,6 +47,8 @@ def _sample_posterior(
     excluded : Optional[npt.NDArray[np.int_]]
         Indexes of the variables to exclude when computing predictions
     """
+    stacked_trees = all_trees
+
     if isinstance(X, Variable):
         X = X.eval()
 
@@ -61,37 +63,17 @@ def _sample_posterior(
     for s in size_iter:
         flatten_size *= s
 
-    idx = rng.integers(0, len(all_trees), size=flatten_size)
+    idx = rng.integers(0, len(stacked_trees), size=flatten_size)
 
-    trees_shape = len(all_trees[0])
+    trees_shape = len(stacked_trees[0])
     leaves_shape = shape // trees_shape
 
     pred = np.zeros((flatten_size, trees_shape, leaves_shape, X.shape[0]))
 
     for ind, p in enumerate(pred):
-        for odim, odim_trees in enumerate(all_trees[idx[ind]]):
+        for odim, odim_trees in enumerate(stacked_trees[idx[ind]]):
             for tree in odim_trees:
-                tree_pred = tree.predict(x=X, excluded=excluded, shape=leaves_shape)
-                # Ensure consistent shape before adding
-                tree_pred = np.asarray(tree_pred, dtype=np.float64)
-                
-                # Handle different dimensionalities
-                if tree_pred.ndim == 0:
-                    tree_pred = tree_pred.reshape(1, 1)
-                elif tree_pred.ndim == 1:
-                    tree_pred = tree_pred.reshape(-1, 1)
-                
-                # Verify shape matches expected
-                expected_shape = (leaves_shape, X.shape[0])
-                if tree_pred.shape != expected_shape:
-                    if tree_pred.size == leaves_shape * X.shape[0]:
-                        tree_pred = tree_pred.reshape(expected_shape)
-                    else:
-                        raise ValueError(
-                            f"Tree prediction size {tree_pred.size} incompatible with "
-                            f"expected size {leaves_shape * X.shape[0]}"
-                        )
-                p[odim] += tree_pred
+                p[odim] += tree.predict(x=X, excluded=excluded, shape=leaves_shape)
 
     return pred.transpose((0, 3, 1, 2)).reshape((*size_iter, -1, shape))
 
