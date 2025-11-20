@@ -153,22 +153,27 @@ def main():
         y_obs = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_train_scaled)
         
         # Create MH sampler for Decision Tables
+        # Use smaller leaf_sd for better regularization
+        # Estimate initial sigma from data
+        initial_sigma = np.std(y_train_scaled)
         step = pmb.MHDecisionTableSampler(
             vars=[mu],
             num_tables=50,
-            move_probs=(0.33, 0.33, 0.34),  # (grow, prune, change)
+            move_probs=(0.25, 0.25, 0.5),  # (grow, prune, change) - favor change moves
             move_adapt_rate=0.1,
             move_prob_prior=0.05,
-            leaf_sd=1.0,
+            leaf_sd=0.1 * initial_sigma,  # Smaller leaf_sd for regularization
             n_jobs=1,
             rng_seed=42,
         )
         
         print("Sampling from posterior...")
+        print(f"Initial sigma estimate: {initial_sigma:.4f}")
+        print(f"Leaf SD: {step.leaf_sd:.4f}")
         # Sample from posterior
         idata = pm.sample(
-            tune=500,  # Warm-up iterations
-            draws=500,  # Posterior samples
+            tune=200,  # Warm-up iterations (reduced for faster testing)
+            draws=200,  # Posterior samples (reduced for faster testing)
             step=step,
             chains=1,
             random_seed=42,
