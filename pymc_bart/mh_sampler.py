@@ -74,18 +74,19 @@ class GrowMove(MHDecisionTableMove):
         if node_mask is None or not np.any(node_mask):
             return new_table, -np.inf
 
-        # Select random split variable
-        split_var = np.random.randint(0, X.shape[1])
+        split_var, split_value = new_table.get_level_predicate(depth)
+        if split_var is None or split_value is None:
+            split_var = np.random.randint(0, X.shape[1])
+            available_splits = _get_available_splits(X, split_var, node_mask)
+            if available_splits.size == 0:
+                return new_table, -np.inf
 
-        # Get available split values
-        available_splits = _get_available_splits(X, split_var, node_mask)
-        if available_splits.size == 0:
-            return new_table, -np.inf
-
-        # Select random split value
-        split_value = table.split_rules[split_var].get_split_value(available_splits)
-        if split_value is None:
-            return new_table, -np.inf
+            split_value_raw = table.split_rules[split_var].get_split_value(available_splits)
+            if split_value_raw is None:
+                return new_table, -np.inf
+            split_value = _ensure_split_array(split_value_raw)
+        else:
+            split_value = split_value.copy()
 
         split_rule = table.split_rules[split_var]
         division = split_rule.divide(X[:, split_var], split_value).astype(bool)
@@ -139,6 +140,8 @@ class PruneMove(MHDecisionTableMove):
         if not split_nodes:
             return new_table, -np.inf
 
+        n_split_nodes_before = len(split_nodes)
+
         # Select random split node
         split_idx = np.random.randint(0, len(split_nodes))
         node_to_prune, _ = split_nodes[split_idx]
@@ -161,11 +164,12 @@ class PruneMove(MHDecisionTableMove):
             nvalue=int(node_mask.sum()),
         )
 
-        # Compute Hastings ratio
-        n_leaf_nodes = new_table.count_leaf_nodes()
-        n_split_nodes = max(new_table.count_split_nodes(), 1)
+        # Compute Hastings ratio (reverse grow selects among new leaves)
+        n_leaf_nodes_after = new_table.count_leaf_nodes()
+        if n_leaf_nodes_after <= 0 or n_split_nodes_before <= 0:
+            return new_table, -np.inf
 
-        log_alpha = np.log(n_leaf_nodes) - np.log(max(n_split_nodes, 1))
+        log_alpha = np.log(n_leaf_nodes_after) - np.log(n_split_nodes_before)
 
         return new_table, log_alpha
 
@@ -193,6 +197,10 @@ class ChangeMove(MHDecisionTableMove):
         split_idx = np.random.randint(0, len(split_nodes))
         node, depth = split_nodes[split_idx]
 
+        node_mask = _get_node_mask(new_table, node, X)
+        if node_mask is None or not node_mask.any():
+            return new_table, -np.inf
+
         # Change split variable (with some probability keep the same)
         if np.random.random() < 0.5:
             new_split_var = node.idx_split_variable
@@ -200,20 +208,29 @@ class ChangeMove(MHDecisionTableMove):
             new_split_var = np.random.randint(0, X.shape[1])
 
         # Get available split values for new variable
-        available_splits = _get_available_splits(X, new_split_var)
+        available_splits = _get_available_splits(X, new_split_var, node_mask)
         if available_splits.size == 0:
             return new_table, -np.inf
 
         # Select split value
-        split_value = table.split_rules[new_split_var].get_split_value(available_splits)
-        if split_value is None:
+        split_value_raw = table.split_rules[new_split_var].get_split_value(available_splits)
+        if split_value_raw is None:
+            return new_table, -np.inf
+        split_value = _ensure_split_array(split_value_raw)
+
+        split_rule = table.split_rules[new_split_var]
+        division = split_rule.divide(X[:, new_split_var], split_value).astype(bool)
+        left_mask = node_mask & division
+        right_mask = node_mask & (~division)
+
+        if not left_mask.any() or not right_mask.any():
             return new_table, -np.inf
 
         # Update node + depth predicate
         new_table.update_level_predicate(
             depth=depth,
             split_variable=new_split_var,
-            split_value=np.array([split_value]),
+            split_value=split_value,
         )
 
         # Hastings ratio = 1 (symmetric proposal)
@@ -310,11 +327,14 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         # Normalize move probabilities
         move_probs = np.array(move_probs)
+        if np.any(move_probs <= 0):
+            raise ValueError("move_probs must all be positive.")
         self.move_probs = move_probs / move_probs.sum()
 
         # Initialize move operators
         self.moves = [GrowMove(), PruneMove(), ChangeMove()]
         self.move_names = ["grow", "prune", "change"]
+        self.reverse_move_idx = [1, 0, 2]
 
         # Initialize decision tables
         self.tables = [
@@ -349,6 +369,7 @@ class MHDecisionTableSampler(ArrayStepShared):
             # Select move type
             move_idx = np.random.choice(len(self.moves), p=self.move_probs)
             move = self.moves[move_idx]
+            reverse_idx = self.reverse_move_idx[move_idx]
 
             # Propose new table
             proposed_table, log_hastings = move.propose(
@@ -366,7 +387,8 @@ class MHDecisionTableSampler(ArrayStepShared):
             log_likelihood_ratio = self._compute_log_likelihood_ratio(old_pred, new_pred)
 
             # Acceptance probability
-            log_alpha = log_likelihood_ratio + log_hastings
+            log_move_ratio = np.log(self.move_probs[reverse_idx]) - np.log(self.move_probs[move_idx])
+            log_alpha = log_likelihood_ratio + log_hastings + log_move_ratio
             if np.log(np.random.random()) < log_alpha:
                 self.tables[table_idx] = proposed_table
                 self.accept_count += 1
@@ -503,3 +525,13 @@ def _get_node_mask(
 
     full_mask = np.ones(X.shape[0], dtype=bool)
     return _traverse(table.root, full_mask)
+
+
+def _ensure_split_array(value) -> npt.NDArray:
+    """Ensure split values are stored as numpy arrays."""
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    arr = np.array(value, copy=True)
+    if arr.ndim == 0:
+        arr = arr[None]
+    return arr

@@ -274,6 +274,26 @@ class DecisionTable:
 
         return split_nodes
 
+    def get_level_predicate(
+        self, depth: int
+    ) -> tuple[int | None, npt.NDArray | None]:
+        """Return (variable, split_value) for the provided depth, if defined."""
+        if depth < 0:
+            return None, None
+        if depth >= len(self.level_variables):
+            return None, None
+
+        split_var = self.level_variables[depth]
+        if split_var < 0:
+            return None, None
+
+        split_value = (
+            self.level_split_values[depth].copy()
+            if depth < len(self.level_split_values)
+            else None
+        )
+        return split_var, split_value
+
     def copy(self) -> "DecisionTable":
         """Create a deep copy of the decision table."""
         def _copy_node(node: DecisionTableNode) -> DecisionTableNode:
