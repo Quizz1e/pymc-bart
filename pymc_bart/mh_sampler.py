@@ -27,7 +27,7 @@ class MHDecisionTableMove:
         self,
         table: DecisionTable,
         X: npt.NDArray,
-        target: npt.NDArray,
+        Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
         context: dict | None = None,
@@ -41,8 +41,8 @@ class MHDecisionTableMove:
             Current decision table
         X : npt.NDArray
             Input data
-        target : npt.NDArray
-            Target residuals for leaf value proposals
+        Y : npt.NDArray
+            Response variable
         leaf_sd : float
             Standard deviation for leaf values
         rng : np.random.Generator
@@ -63,7 +63,7 @@ class GrowMove(MHDecisionTableMove):
         self,
         table: DecisionTable,
         X: npt.NDArray,
-        target: npt.NDArray,
+        Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
         context: dict | None = None,
@@ -114,8 +114,8 @@ class GrowMove(MHDecisionTableMove):
         if not left_mask.any() or not right_mask.any():
             return new_table, -np.inf, None
 
-        left_value = _draw_leaf_value(target, leaf_sd, left_mask, rng)
-        right_value = _draw_leaf_value(target, leaf_sd, right_mask, rng)
+        left_value = _draw_leaf_value(Y, leaf_sd, left_mask, rng)
+        right_value = _draw_leaf_value(Y, leaf_sd, right_mask, rng)
         old_value = leaf_node.value.copy()
 
         # Grow the leaf
@@ -156,7 +156,7 @@ class PruneMove(MHDecisionTableMove):
         self,
         table: DecisionTable,
         X: npt.NDArray,
-        target: npt.NDArray,
+        Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
         context: dict | None = None,
@@ -204,7 +204,7 @@ class PruneMove(MHDecisionTableMove):
             return new_table, -np.inf, None
 
         # Draw new leaf value
-        new_leaf_value = _draw_leaf_value(target, leaf_sd, node_mask, rng)
+        new_leaf_value = _draw_leaf_value(Y, leaf_sd, node_mask, rng)
 
         # Prune: convert split node to leaf
         new_table.prune_node(
@@ -240,7 +240,7 @@ class ChangeMove(MHDecisionTableMove):
         self,
         table: DecisionTable,
         X: npt.NDArray,
-        target: npt.NDArray,
+        Y: npt.NDArray,
         leaf_sd: float,
         rng: np.random.Generator,
         context: dict | None = None,
@@ -455,9 +455,9 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         self.table_predictions = [t.predict(self.X) for t in self.tables]
         self.mask_cache = [dict() for _ in range(self.m)]
+        self._y_ll = self.Y.astype(np.float64, copy=False).ravel()
 
         self.all_tables = [[t.trim() for t in self.tables]]
-        self._sync_all_trees()
         self.accept_count = 0
         self.iteration = 0
         self.model = model
@@ -478,17 +478,8 @@ class MHDecisionTableSampler(ArrayStepShared):
             size=self.m,
             dtype=np.int64,
         )
-        stacked_predictions = np.stack(self.table_predictions, axis=0)
-        ensemble_sum = stacked_predictions.sum(axis=0)
-        residuals = self.Y - (ensemble_sum - stacked_predictions)
         tasks = [
-            (
-                idx,
-                self.tables[idx],
-                self.table_predictions[idx],
-                residuals[idx],
-                int(seeds[idx]),
-            )
+            (idx, self.tables[idx], self.table_predictions[idx], int(seeds[idx]))
             for idx in range(self.m)
         ]
 
@@ -516,10 +507,9 @@ class MHDecisionTableSampler(ArrayStepShared):
 
         # Store all tables for posterior inference
         self.all_tables.append([t.trim() for t in self.tables])
-        self._sync_all_trees()
 
         # Compute ensemble predictions
-        ensemble_pred = np.sum(np.stack(self.table_predictions, axis=0), axis=0)
+        ensemble_pred = np.mean(np.stack(self.table_predictions, axis=0), axis=0)
 
         accept_rate = np.mean(accept_rates) if accept_rates else 0.0
         variable_inclusion_encoded = _encode_vi(variable_inclusion.tolist())
@@ -538,7 +528,6 @@ class MHDecisionTableSampler(ArrayStepShared):
         table_idx: int,
         table: DecisionTable,
         current_prediction: npt.NDArray,
-        residual: npt.NDArray,
         rng_seed: int,
     ) -> dict:
         """Execute a single MH proposal for one table (optionally in parallel)."""
@@ -555,7 +544,7 @@ class MHDecisionTableSampler(ArrayStepShared):
         proposed_table, log_hastings, move_metadata = move.propose(
             table,
             self.X,
-            residual,
+            self.Y,
             self.leaf_sd,
             rng,
             context,
@@ -578,7 +567,7 @@ class MHDecisionTableSampler(ArrayStepShared):
         if new_prediction is None:
             new_prediction = proposed_table.predict(self.X)
         log_likelihood_ratio = self._compute_log_likelihood_ratio(
-            residual, current_prediction, new_prediction
+            current_prediction, new_prediction
         )
 
         log_move_ratio = np.log(self.move_probs[reverse_idx]) - np.log(
@@ -605,25 +594,20 @@ class MHDecisionTableSampler(ArrayStepShared):
 
     def _compute_log_likelihood_ratio(
         self,
-        residual: npt.NDArray,
         old_pred: npt.NDArray,
         new_pred: npt.NDArray,
     ) -> float:
         """Compute log likelihood ratio for MH acceptance."""
-        target_flat = np.asarray(residual, dtype=np.float64).ravel()
         old_flat = np.asarray(old_pred, dtype=np.float64).ravel()
         new_flat = np.asarray(new_pred, dtype=np.float64).ravel()
 
-        if (
-            target_flat.shape[0] != old_flat.shape[0]
-            or target_flat.shape[0] != new_flat.shape[0]
-        ):
+        if old_flat.shape[0] != self._y_ll.shape[0] or new_flat.shape[0] != self._y_ll.shape[0]:
             raise ValueError(
-                "Residuals and predictions must share the same flattened size."
+                "Predictions and observations must share the same flattened size."
             )
 
         return _log_likelihood_ratio_numba(
-            target_flat,
+            self._y_ll,
             old_flat,
             new_flat,
             float(self.leaf_sd),
@@ -681,18 +665,6 @@ class MHDecisionTableSampler(ArrayStepShared):
             return flat_pred.reshape(new_pred.shape)
 
         return None
-
-    def _sync_all_trees(self) -> None:
-        """Keep the BART operator's tree store in sync with the sampler state."""
-        proxy = getattr(self.bart, "all_trees", None)
-        if proxy is None:
-            return
-
-        while len(proxy):
-            proxy.pop()
-
-        for tables in self.all_tables:
-            proxy.append(tables)
 
     def _update_move_probabilities(self, results: list[dict]) -> None:
         """Adapt move probabilities using recent acceptance outcomes."""
@@ -801,18 +773,18 @@ def _get_available_splits(
 
 
 def _draw_leaf_value(
-    target: npt.NDArray,
+    Y: npt.NDArray,
     leaf_sd: float,
     mask: npt.NDArray | None,
     rng: np.random.Generator,
 ) -> npt.NDArray:
-    """Draw a leaf value from normal distribution centered on residual target."""
+    """Draw a leaf value from normal distribution."""
     if mask is not None and mask.any():
-        mask = _normalize_mask(mask, target.shape[0])
-        effective_target = target[mask]
+        mask = _normalize_mask(mask, Y.shape[0])
+        target = Y[mask]
     else:
-        effective_target = target
-    return np.array([np.mean(effective_target) + rng.normal(0.0, leaf_sd)])
+        target = Y
+    return np.array([np.mean(target) + rng.normal(0.0, leaf_sd)])
 
 
 def _get_node_mask(
@@ -911,18 +883,18 @@ def _split_decision(
 
 @njit(cache=True, fastmath=True)
 def _log_likelihood_ratio_numba(
-    residual: np.ndarray,
+    y: np.ndarray,
     old_pred: np.ndarray,
     new_pred: np.ndarray,
     leaf_sd: float,
 ) -> float:
-    """Numba-accelerated log-likelihood ratio using residual targets."""
+    """Numba-accelerated log-likelihood ratio."""
     inv_var = 1.0 / (leaf_sd * leaf_sd)
     sse_old = 0.0
     sse_new = 0.0
-    for i in range(residual.size):
-        diff_old = residual[i] - old_pred[i]
-        diff_new = residual[i] - new_pred[i]
+    for i in range(y.size):
+        diff_old = y[i] - old_pred[i]
+        diff_new = y[i] - new_pred[i]
         sse_old += diff_old * diff_old
         sse_new += diff_new * diff_new
     return 0.5 * (sse_old - sse_new) * inv_var
