@@ -86,33 +86,22 @@ class GrowMove(MHDecisionTableMove):
             return new_table, -np.inf, None
 
         split_var, split_value = new_table.get_level_predicate(depth)
-        feature_splits = context.get("feature_splits") if context else None
         if split_var is None or split_value is None:
-            scored_choice = _select_scored_split(
-                new_table,
+            split_var = rng.integers(0, X.shape[1])
+            feature_splits = context.get("feature_splits") if context else None
+            available_splits = _get_cached_split_candidates(
                 X,
-                Y,
+                split_var,
                 node_mask,
-                rng,
-                context,
+                feature_splits[split_var] if feature_splits else None,
             )
-            if scored_choice is not None:
-                split_var, split_value = scored_choice
-            else:
-                split_var = rng.integers(0, X.shape[1])
-                available_splits = _get_cached_split_candidates(
-                    X,
-                    split_var,
-                    node_mask,
-                    feature_splits[split_var] if feature_splits else None,
-                )
-                if available_splits.size == 0:
-                    return new_table, -np.inf, None
+            if available_splits.size == 0:
+                return new_table, -np.inf, None
 
-                split_value_raw = table.split_rules[split_var].get_split_value(available_splits)
-                if split_value_raw is None:
-                    return new_table, -np.inf, None
-                split_value = _ensure_split_array(split_value_raw)
+            split_value_raw = table.split_rules[split_var].get_split_value(available_splits)
+            if split_value_raw is None:
+                return new_table, -np.inf, None
+            split_value = _ensure_split_array(split_value_raw)
         else:
             split_value = split_value.copy()
 
@@ -275,40 +264,28 @@ class ChangeMove(MHDecisionTableMove):
         if node_mask is None or not node_mask.any():
             return new_table, -np.inf, None
 
-        scored_choice = _select_scored_split(
-            new_table,
-            X,
-            Y,
-            node_mask,
-            rng,
-            context,
-        )
-
-        if scored_choice is not None:
-            new_split_var, split_value = scored_choice
+        # Change split variable (with some probability keep the same)
+        if rng.random() < 0.5:
+            new_split_var = node.idx_split_variable
         else:
-            # Change split variable (with some probability keep the same)
-            if rng.random() < 0.5:
-                new_split_var = node.idx_split_variable
-            else:
-                new_split_var = rng.integers(0, X.shape[1])
+            new_split_var = rng.integers(0, X.shape[1])
 
-            # Get available split values for new variable
-            feature_splits = context.get("feature_splits") if context else None
-            available_splits = _get_cached_split_candidates(
-                X,
-                new_split_var,
-                node_mask,
-                feature_splits[new_split_var] if feature_splits else None,
-            )
-            if available_splits.size == 0:
-                return new_table, -np.inf, None
+        # Get available split values for new variable
+        feature_splits = context.get("feature_splits") if context else None
+        available_splits = _get_cached_split_candidates(
+            X,
+            new_split_var,
+            node_mask,
+            feature_splits[new_split_var] if feature_splits else None,
+        )
+        if available_splits.size == 0:
+            return new_table, -np.inf, None
 
-            # Select split value
-            split_value_raw = table.split_rules[new_split_var].get_split_value(available_splits)
-            if split_value_raw is None:
-                return new_table, -np.inf, None
-            split_value = _ensure_split_array(split_value_raw)
+        # Select split value
+        split_value_raw = table.split_rules[new_split_var].get_split_value(available_splits)
+        if split_value_raw is None:
+            return new_table, -np.inf, None
+        split_value = _ensure_split_array(split_value_raw)
 
         split_rule = table.split_rules[new_split_var]
         division = _split_decision(split_rule, X[:, new_split_var], split_value)
@@ -353,18 +330,6 @@ class MHDecisionTableSampler(ArrayStepShared):
     move_prob_prior : float
         Positive prior weight added to each move score before normalization.
         Helps keep all moves selectable. Defaults to 0.05.
-    enable_split_scoring : bool
-        Whether to use SSE-based scoring when picking new split predicates.
-        Defaults to True.
-    smart_split_vars : int
-        Maximum number of candidate variables evaluated per scored split.
-        Defaults to 8.
-    smart_split_values : int
-        Maximum number of candidate thresholds evaluated per variable.
-        Defaults to 16.
-    min_leaf_size : int
-        Minimum number of observations required in every child after a split.
-        Defaults to 5.
     leaf_sd : float
         Standard deviation for leaf values. Defaults to 1.0
     n_jobs : int
@@ -393,10 +358,6 @@ class MHDecisionTableSampler(ArrayStepShared):
         move_probs: tuple[float, float, float] = (0.33, 0.33, 0.34),
         move_adapt_rate: float = 0.1,
         move_prob_prior: float = 0.05,
-        enable_split_scoring: bool = True,
-        smart_split_vars: int = 8,
-        smart_split_values: int = 16,
-        min_leaf_size: int = 5,
         leaf_sd: float = 1.0,
         n_jobs: int = 1,
         rng_seed: int | None = None,
@@ -456,10 +417,6 @@ class MHDecisionTableSampler(ArrayStepShared):
         self.feature_splits = [
             _get_available_splits(self.X, var_idx) for var_idx in range(self.num_variates)
         ]
-        self.enable_split_scoring = bool(enable_split_scoring)
-        self.max_split_vars = max(1, int(smart_split_vars))
-        self.max_split_values = max(1, int(smart_split_values))
-        self.min_leaf_size = max(1, int(min_leaf_size))
 
         # Normalize move probabilities
         move_probs = np.array(move_probs)
@@ -582,10 +539,6 @@ class MHDecisionTableSampler(ArrayStepShared):
         context = {
             "feature_splits": self.feature_splits,
             "mask_cache": self.mask_cache[table_idx],
-            "enable_split_scoring": self.enable_split_scoring,
-            "max_split_vars": self.max_split_vars,
-            "max_split_values": self.max_split_values,
-            "min_leaf_size": self.min_leaf_size,
         }
 
         proposed_table, log_hastings, move_metadata = move.propose(
@@ -895,111 +848,6 @@ def _get_node_path(table: DecisionTable, target_node: DecisionTableNode) -> tupl
         for child_idx, child in node.children.items():
             stack.append((child, path + (child_idx,)))
     return None
-
-
-def _select_scored_split(
-    table: DecisionTable,
-    X: npt.NDArray,
-    Y: npt.NDArray,
-    node_mask: npt.NDArray,
-    rng: np.random.Generator,
-    context: dict | None,
-    force_var: int | None = None,
-) -> tuple[int, npt.NDArray] | None:
-    """Pick split with max SSE reduction while respecting min leaf sizes."""
-    if (
-        context is None
-        or not context.get("enable_split_scoring", False)
-        or node_mask is None
-        or not np.any(node_mask)
-    ):
-        return None
-
-    min_leaf_size = int(context.get("min_leaf_size", 1))
-    sample_idx = np.flatnonzero(node_mask)
-    if sample_idx.size < 2 * min_leaf_size:
-        return None
-
-    target = Y[sample_idx]
-    total_sse = _sum_squared_error(target)
-    if not np.isfinite(total_sse):
-        return None
-
-    feature_splits = context.get("feature_splits")
-    max_vars = int(context.get("max_split_vars", X.shape[1]))
-    max_values = int(context.get("max_split_values", 16))
-
-    if force_var is not None:
-        candidate_vars = np.array([force_var], dtype=int)
-    else:
-        candidate_vars = _sample_candidate_variables(X.shape[1], max_vars, rng)
-
-    best_var: int | None = None
-    best_value: npt.NDArray | None = None
-    best_score = -np.inf
-
-    for var_idx in candidate_vars:
-        cached_values = feature_splits[var_idx] if feature_splits else None
-        candidates = _get_cached_split_candidates(
-            X,
-            var_idx,
-            node_mask,
-            cached_values,
-        )
-        if candidates.size == 0:
-            continue
-        if candidates.size > max_values:
-            grid_idx = np.linspace(0, candidates.size - 1, max_values, dtype=int)
-            candidates_subset = candidates[grid_idx]
-        else:
-            candidates_subset = candidates
-
-        feature_values = X[sample_idx, var_idx]
-        split_rule = table.split_rules[var_idx]
-
-        for candidate in candidates_subset:
-            split_value = _ensure_split_array(candidate)
-            division = split_rule.divide(feature_values, split_value)
-            left_count = int(np.sum(division))
-            right_count = division.size - left_count
-            if left_count < min_leaf_size or right_count < min_leaf_size:
-                continue
-
-            left_target = target[division]
-            right_target = target[~division]
-
-            left_sse = _sum_squared_error(left_target)
-            right_sse = _sum_squared_error(right_target)
-
-            gain = total_sse - (left_sse + right_sse)
-            if gain > best_score and np.isfinite(gain):
-                best_score = gain
-                best_var = var_idx
-                best_value = split_value
-
-    if best_var is None or best_value is None:
-        return None
-
-    return best_var, best_value
-
-
-def _sample_candidate_variables(
-    num_variates: int, max_vars: int, rng: np.random.Generator
-) -> npt.NDArray:
-    """Return subset of variable indices to evaluate."""
-    max_vars = max(1, int(max_vars))
-    if max_vars >= num_variates:
-        return np.arange(num_variates, dtype=int)
-    return rng.choice(num_variates, size=max_vars, replace=False)
-
-
-def _sum_squared_error(values: npt.NDArray) -> float:
-    """Return SSE of values when modeled with their mean."""
-    if values.size == 0:
-        return np.inf
-    sum_y = float(values.sum())
-    sum_sq = float(np.dot(values, values))
-    return sum_sq - (sum_y * sum_y) / values.size
 
 
 def _ensure_split_array(value) -> npt.NDArray:
